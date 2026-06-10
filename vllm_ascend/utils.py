@@ -511,6 +511,8 @@ def setup_ascend_local_comm_res(local_rank: int, kv_transfer_config: Any | None)
     extra_config = kv_transfer_config.kv_connector_extra_config or {}
     local_comm_res_path = extra_config.get("ascend_local_comm_res_path")
     if not local_comm_res_path:
+        local_comm_res_path = os.environ.get("ASCEND_LOCAL_COMM_RES_PATH")
+    if not local_comm_res_path:
         return
 
     if not devices:

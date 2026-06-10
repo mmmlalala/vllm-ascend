@@ -153,18 +153,34 @@ class ACLGraphWrapper:
                     stack.enter_context(patch("torch.npu.empty_cache", lambda: None))
 
                 # mind-exploding: carefully manage the reference and memory.
+
+                # Sync offloader's copy stream before capture.
+                # Ensure any pre-capture prefetches from offloader are complete.
+                from vllm.model_executor.offloader.base import get_offloader
+
+                get_offloader().sync_prev_onload()
                 forward_context.capturing = True
-                with torch.npu.graph(aclgraph, pool=self.graph_pool):
-                    # `output` is managed by pytorch's aclgraph pool
-                    output = self.runnable(*args, **kwargs)
-                    if self.aclgraph_options.weak_ref_output:
-                        # by converting it to weak ref,
-                        # the original `output` will immediately be released
-                        # to save memory. It is only safe to do this for
-                        # the last graph in piecewise aclgraph mode, because
-                        # the output of the last graph will not be used by
-                        # any other acl graph.
-                        output = weak_ref_tensors(output)
+                try:
+                    with torch.npu.graph(aclgraph, pool=self.graph_pool):
+                        # `output` is managed by pytorch's aclgraph pool
+                        output = self.runnable(*args, **kwargs)
+                        # Join offloader's copy stream after forward to avoid
+                        # unjoined stream error. The last layer's start_prefetch
+                        # forks copy_stream, but wait_prefetch only happens in
+                        # the next forward pass.
+                        get_offloader().join_after_forward()
+                        if self.aclgraph_options.weak_ref_output:
+                            # by converting it to weak ref,
+                            # the original `output` will immediately be released
+                            # to save memory. It is only safe to do this for
+                            # the last graph in piecewise aclgraph mode, because
+                            # the output of the last graph will not be used by
+                            # any other acl graph.
+                            output = weak_ref_tensors(output)
+                except RuntimeError as exc:
+                    if _is_stream_resource_capture_error(exc):
+                        _raise_stream_resource_capture_error(exc)
+                    raise
 
             # here we always use weak ref for the workspaces
             # to save memory

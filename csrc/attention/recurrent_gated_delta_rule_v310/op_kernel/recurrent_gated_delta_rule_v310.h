@@ -23,7 +23,7 @@ namespace RecurrentGatedDeltaRuleV310 {
 using namespace AscendC;
 constexpr uint64_t BUFFER_NUM = 1;
 constexpr uint32_t MAX_OUT_BUFFER_NUM = 2;
-constexpr uint64_t MAX_MTP = 8;
+constexpr uint64_t MAX_MTP = 16;
 constexpr uint64_t BF16_NUM_PER_BLOCK = 16;
 constexpr uint64_t FP32_NUM_PER_BLOCK = 8;
 constexpr uint32_t REPEAT_LENTH = 64; // 256Byte for float
@@ -204,6 +204,7 @@ public:
         restUbSize_ = tilingData->ubRestBytes;
         alignK_ = Ceil(tilingData->dk, BF16_NUM_PER_BLOCK) * BF16_NUM_PER_BLOCK;
         alignV_ = Ceil(tilingData->dv, BF16_NUM_PER_BLOCK) * BF16_NUM_PER_BLOCK;
+        aNv_ = Ceil(tilingData->nv, BF16_NUM_PER_BLOCK) * BF16_NUM_PER_BLOCK;
         load = 0;
         usedblk = 0;
     }
@@ -242,19 +243,17 @@ public:
         uint32_t singleVSize = vStep_ * sizeof(float);
         uint32_t vSize = MAX_MTP * alignV_ * sizeof(float);
         uint32_t kSize = MAX_MTP * alignK_ * sizeof(float);
-        uint32_t betaUbSize =
-            Ceil(MAX_MTP * NV_, BF16_NUM_PER_BLOCK) * BF16_NUM_PER_BLOCK * sizeof(float); //  8: 8 * 4 = 32B;
         pipe_->InitBuffer(qInBuf_, MAX_MTP * alignK_ * sizeof(inType));
         pipe_->InitBuffer(kInBuf_, MAX_MTP * alignK_ * sizeof(inType));
         pipe_->InitBuffer(vInBuf_, MAX_MTP * alignV_ * sizeof(inType));
         pipe_->InitBuffer(stateInBuf_, alignK_ * vStep_ * sizeof(inType));
         if (hasGama_) {
-            pipe_->InitBuffer(gamaInBuf_, MAX_MTP * NV_ * sizeof(float));
+            pipe_->InitBuffer(gamaInBuf_, MAX_MTP * aNv_ * sizeof(float));
         }
         if (hasGamaK_) {
             pipe_->InitBuffer(gamaKInBuf_, MAX_MTP * alignK_ * sizeof(float));
         }
-        pipe_->InitBuffer(betaInBuf_, MAX_MTP * NV_ * sizeof(inType));
+        pipe_->InitBuffer(betaInBuf_, MAX_MTP * aNv_ * sizeof(inType));
         pipe_->InitBuffer(stateOutBuf_, alignK_ * vStep_ * sizeof(outType));
         pipe_->InitBuffer(attnOutBuf_, vStep_ * sizeof(outType));
         pipe_->InitBuffer(tmpBuff, restUbSize_);
@@ -273,8 +272,8 @@ public:
         buffOffset += cubeSize + 128;
         broadTmpInUb = tmpBuff.GetWithOffset<float>(static_cast<uint32_t>(alignK_ * vStep_), buffOffset);
         buffOffset += cubeSize;
-        betaInUb = tmpBuff.GetWithOffset<float>(static_cast<uint32_t>(betaUbSize), buffOffset);
-        buffOffset += betaUbSize;
+        betaInUb = tmpBuff.GetWithOffset<float>(MAX_MTP * aNv_, buffOffset);
+        buffOffset += MAX_MTP * aNv_ * sizeof(float);
         uint32_t halfK_ = alignK_ >> 1;
         foldTmpUb = tmpBuff.GetWithOffset<float>(static_cast<uint32_t>(halfK_ * vStep_), buffOffset);
     }
@@ -652,6 +651,7 @@ private:
     uint32_t alignK_;
     uint32_t realK_;
     uint32_t NV_;
+    uint32_t aNv_;
     uint32_t alignV_;
     uint32_t realV_;
     uint32_t vStep_;

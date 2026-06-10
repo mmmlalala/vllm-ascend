@@ -25,7 +25,7 @@ using namespace AscendC;
 using namespace AscendC::MicroAPI;
 constexpr uint64_t BUFFER_NUM = 1;
 constexpr uint32_t MAX_OUT_BUFFER_NUM = 2;
-constexpr uint64_t MAX_MTP = 8;
+constexpr uint64_t MAX_MTP = 16;
 constexpr uint64_t BF16_NUM_PER_BLOCK = 16;
 constexpr uint64_t FP32_NUM_PER_BLOCK = 8;
 constexpr uint32_t REPEAT_LENTH = 64; // 256Byte for float
@@ -77,6 +77,7 @@ public:
         restUbSize_ = tilingData->ubRestBytes;
         alignK_ = Ceil(tilingData->dk, BF16_NUM_PER_BLOCK) * BF16_NUM_PER_BLOCK;
         alignV_ = Ceil(tilingData->dv, BF16_NUM_PER_BLOCK) * BF16_NUM_PER_BLOCK;
+        aNv_ = Ceil(tilingData->nv, BF16_NUM_PER_BLOCK) * BF16_NUM_PER_BLOCK;
         load = 0;
         usedblk = 0;
     }
@@ -115,19 +116,17 @@ public:
         uint32_t singleVSize = vStep_ * sizeof(float);
         uint32_t vSize = MAX_MTP * alignV_ * sizeof(float);
         uint32_t kSize = MAX_MTP * alignK_ * sizeof(float);
-        uint32_t betaNumAlign = Ceil(MAX_MTP * NV_, BF16_NUM_PER_BLOCK) * BF16_NUM_PER_BLOCK;
-        uint32_t betaUbSize = betaNumAlign * sizeof(float); //  8: 8 * 4 = 32B;
         pipe_->InitBuffer(qInQueue_, BUFFER_NUM, MAX_MTP * alignK_ * sizeof(inType));
         pipe_->InitBuffer(kInQueue_, BUFFER_NUM, MAX_MTP * alignK_ * sizeof(inType));
         pipe_->InitBuffer(vInQueue_, BUFFER_NUM, MAX_MTP * alignV_ * sizeof(inType));
         pipe_->InitBuffer(stateInQueue_, BUFFER_NUM, alignK_ * vStep_ * sizeof(stateType));
         if (hasGama_) {
-            pipe_->InitBuffer(gamaInQueue_, BUFFER_NUM, MAX_MTP * NV_ * sizeof(float));
+            pipe_->InitBuffer(gamaInQueue_, BUFFER_NUM, MAX_MTP * aNv_ * sizeof(float));
         }
         if (hasGamaK_) {
             pipe_->InitBuffer(gamaKInQueue_, BUFFER_NUM, MAX_MTP * alignK_ * sizeof(float));
         }
-        pipe_->InitBuffer(betaInQueue_, BUFFER_NUM, MAX_MTP * NV_ * sizeof(inType));
+        pipe_->InitBuffer(betaInQueue_, BUFFER_NUM, MAX_MTP * aNv_ * sizeof(inType));
         pipe_->InitBuffer(stateOutQueue_, stateOutBufferNum_, alignK_ * vStep_ * sizeof(stateType));
         pipe_->InitBuffer(attnOutQueue_, attnOutBufferNum_, vStep_ * sizeof(outType));
         pipe_->InitBuffer(tmpBuff, restUbSize_);
@@ -146,9 +145,7 @@ public:
         buffOffset += cubeSize;
         broadTmpInUb = tmpBuff.GetWithOffset<float>(static_cast<uint32_t>(alignK_ * vStep_), buffOffset);
         buffOffset += cubeSize;
-        betaInUb = tmpBuff.GetWithOffset<float>(static_cast<uint32_t>(betaNumAlign), buffOffset);
-        buffOffset += betaUbSize;
-        gamaInUb = tmpBuff.GetWithOffset<float>(static_cast<uint32_t>(betaNumAlign), buffOffset);
+        betaInUb = tmpBuff.GetWithOffset<float>(MAX_MTP * aNv_, buffOffset);
     }
 
     __aicore__ inline void ComputeAvgload()
@@ -197,6 +194,9 @@ public:
                     CopyInGamaBeta(seq0, seq1);
                 }
                 ProcessHead(seq0, seq1, head_i, stateOffset);
+            }
+            if (hasGama_ && copyFlag != 0) {
+                gamaInQueue_.FreeTensor(gamaInUb);
             }
         }
     }
@@ -478,9 +478,9 @@ private:
             DataCopyParams gamaInParams{1, static_cast<uint16_t>(seqLen * NV_ * sizeof(float)), 0, 0};
             DataCopyPad(gamaLocal, gamaGm_[seq0 * NV_], gamaInParams, padParams);
             gamaInQueue_.EnQue<float>(gamaLocal);
-            gamaLocal = gamaInQueue_.DeQue<float>();
-            Exp(gamaInUb, gamaLocal, seqLen * NV_);
-            gamaInQueue_.FreeTensor(gamaLocal);
+            gamaInUb = gamaInQueue_.DeQue<float>();
+            Exp(gamaInUb, gamaInUb, seqLen * NV_);
+            AscendC::PipeBarrier<PIPE_V>();
         }
     }
 
@@ -604,6 +604,7 @@ private:
     uint32_t alignK_;
     uint32_t realK_;
     uint32_t NV_;
+    uint32_t aNv_;
     uint32_t alignV_;
     uint32_t realV_;
     uint32_t vStep_;

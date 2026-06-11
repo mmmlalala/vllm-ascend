@@ -292,6 +292,9 @@ class DeepSeekV4MTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
             if ".w3." in name:
                 name = name.replace(".w3.", ".up_proj.")
 
+            if name.endswith(".scale"):
+                name = name.replace(".scale", ".weight_scale")
+
             if ".head." in name:
                 name = name.replace(".head.", ".shared_head.head.")
 

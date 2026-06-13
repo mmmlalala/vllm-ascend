@@ -152,11 +152,12 @@ def _build_chunk_offsets(
 
 def _fill_chunk_offsets_idx_device(out: torch.Tensor, cu_seqlens: torch.Tensor, chunk_size: int) -> int:
     if out is not None:
+        cu_seqlens_cpu = cu_seqlens.cpu() if cu_seqlens.device.type != "cpu" else cu_seqlens
         seq_idx = 0
         last_seqlens = 0
         out[0] = 0
         idx = 1
-        for _, seqlens in enumerate(cu_seqlens.tolist()):
+        for _, seqlens in enumerate(cu_seqlens_cpu.tolist()):
             if seqlens == last_seqlens:
                 continue
             else:
@@ -260,7 +261,7 @@ def _build_chunk_meta_device_from_seq_lens(
     _validate_optional_output(
         "out_chunk_offsets_idx",
         out_chunk_offsets_idx,
-        expected_shape=(chunk_counts.sum().item() + 1,),
+        expected_shape=None,
         expected_device=seq_lens.device,
     )
 

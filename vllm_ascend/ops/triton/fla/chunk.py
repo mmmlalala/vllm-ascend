@@ -16,8 +16,6 @@ from vllm.distributed import get_pcp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fla.ops.utils import SUPPRESS_LEVEL
 
-import cloud_ops_turbo
-
 from .chunk_delta_h import chunk_gated_delta_rule_fwd_h  # noqa: F401
 from .chunk_delta_hupdate import chunk_gated_delta_rule_fwd_hupdate
 from .chunk_o import chunk_fwd_o  # noqa: F401
@@ -84,6 +82,7 @@ def chunk_gated_delta_rule_fwd(
     if attn_metadata is not None:
         num_decodes = attn_metadata.num_decodes
     chunk_size = 64
+    import cloud_ops_turbo  # Lazy import to avoid loading SO at module import time
     block_indices_cumsum = None if prebuilt_meta is None else prebuilt_meta.block_indices_cumsum
     cu_seqlens_host = None if prebuilt_meta is None else prebuilt_meta.cu_seqlens_host
     chunk_indices_chunk64 = None if prebuilt_meta is None else prebuilt_meta.chunk_indices_chunk64

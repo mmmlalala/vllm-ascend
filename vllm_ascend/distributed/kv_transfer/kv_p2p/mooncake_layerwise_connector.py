@@ -888,6 +888,16 @@ class MooncakeLayerwiseConnectorScheduler:
             if not do_virtual:
                 req = request  # capture for callback closure
 
+                # Register a threading.Event so that the scheduler patch can
+                # wait for last_token_id if the KV transfer completes before
+                # the metaserver response arrives (race condition fix).
+                from vllm_ascend.patch.platform.patch_last_token_id import (
+                    notify_last_token_id_ready,
+                    register_last_token_id_event,
+                )
+
+                last_token_id_event = register_last_token_id_event(request.request_id)
+
                 future = self.executor.submit(
                     self._access_metaserver, url=params.get("metaserver", None), message=kv_transfer_params
                 )
@@ -895,6 +905,9 @@ class MooncakeLayerwiseConnectorScheduler:
                 def handle_metaserver_response(future):
                     if future.exception():
                         logger.error("Access metaserver fail: %s", future.exception())
+                        # Signal the event even on failure so the scheduler
+                        # doesn't block indefinitely.
+                        notify_last_token_id_ready(request.request_id)
                         return
                     try:
                         response = future.result()
@@ -912,6 +925,11 @@ class MooncakeLayerwiseConnectorScheduler:
                                 )
                     except Exception as e:
                         logger.error("Failed to process metaserver response: %s", e)
+                    finally:
+                        # Always signal the event so the scheduler patch
+                        # doesn't block indefinitely, even if last_token_id
+                        # was not found in the response.
+                        notify_last_token_id_ready(request.request_id)
 
                 future.add_done_callback(handle_metaserver_response)
 

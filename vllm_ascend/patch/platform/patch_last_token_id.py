@@ -34,6 +34,19 @@
 # The detokenizer will correctly decode the output because it uses the
 # prompt_token_ids (which now include last_token_id) as context.
 #
+# RACE CONDITION FIX: The metaserver response (which carries last_token_id)
+# and the KV cache transfer completion are two parallel asynchronous events.
+# The metaserver callback stores last_token_id into request.kv_transfer_params
+# asynchronously. If the KV transfer completes before the metaserver response
+# arrives, _update_waiting_for_remote_kv is called without last_token_id
+# available, causing the fix to be skipped intermittently.
+#
+# To fix this, we use a threading.Event per request to synchronize the
+# metaserver callback with the scheduler. When _update_waiting_for_remote_kv
+# is called and last_token_id is not yet available, we wait for the event
+# (with a timeout). The metaserver callback signals the event after storing
+# last_token_id.
+#
 # NOTE: The text of last_token_id itself is not included in the output
 # because it's treated as a prompt token. This means the first reasoning
 # token's text may be missing from the reasoning_content. However, this
@@ -42,10 +55,45 @@
 # and update the detokenizer accordingly.
 #
 
+import threading
+
 from vllm.logger import logger
 from vllm.v1.core.sched.scheduler import Scheduler
 
 _original_update_waiting_for_remote_kv = Scheduler._update_waiting_for_remote_kv
+
+# Module-level registry for synchronizing metaserver callback with scheduler.
+# Key: request_id, Value: threading.Event that is set when last_token_id arrives.
+_last_token_id_events: dict[str, threading.Event] = {}
+
+# Timeout for waiting for last_token_id from the metaserver callback.
+# The metaserver call is an HTTP request that triggers the prefill instance,
+# which typically completes in <1 second. 10 seconds is a generous timeout.
+_LAST_TOKEN_ID_WAIT_TIMEOUT = 10.0
+
+
+def register_last_token_id_event(request_id: str) -> threading.Event:
+    """Register a threading.Event for a request to synchronize last_token_id.
+
+    Called by MooncakeLayerwiseConnectorScheduler.update_state_after_alloc()
+    before submitting the async metaserver request. Returns the Event that
+    the metaserver callback should signal after storing last_token_id.
+    """
+    event = threading.Event()
+    _last_token_id_events[request_id] = event
+    return event
+
+
+def notify_last_token_id_ready(request_id: str) -> None:
+    """Signal that last_token_id has been stored for a request.
+
+    Called by the metaserver callback after storing last_token_id into
+    request.kv_transfer_params. This unblocks the scheduler if it is
+    waiting for last_token_id in _update_waiting_for_remote_kv.
+    """
+    event = _last_token_id_events.pop(request_id, None)
+    if event is not None:
+        event.set()
 
 
 def _patched_update_waiting_for_remote_kv(self, request):
@@ -74,6 +122,42 @@ def _patched_update_waiting_for_remote_kv(self, request):
         last_token_id = params["last_token_id"]
         # Remove last_token_id from params to avoid re-processing
         del params["last_token_id"]
+
+    # If last_token_id is not yet available, wait for the metaserver
+    # callback to deliver it. This handles the race condition where the
+    # KV transfer completes before the metaserver response arrives.
+    if last_token_id is None:
+        event = _last_token_id_events.get(request.request_id)
+        if event is not None:
+            logger.info(
+                "Waiting for last_token_id from prefill for request %s "
+                "(metaserver response not yet arrived)",
+                request.request_id,
+            )
+            event.wait(timeout=_LAST_TOKEN_ID_WAIT_TIMEOUT)
+            # Clean up the event
+            _last_token_id_events.pop(request.request_id, None)
+
+        # Re-check kv_transfer_params after waiting (or if the event
+        # was already consumed by the callback). This handles the case
+        # where the callback stored last_token_id and signaled the event
+        # between our first check and the event lookup.
+        params = request.kv_transfer_params
+        if params and "last_token_id" in params:
+            last_token_id = params["last_token_id"]
+            del params["last_token_id"]
+            logger.info(
+                "Received last_token_id=%s after waiting for request %s",
+                last_token_id,
+                request.request_id,
+            )
+        elif event is not None:
+            logger.warning(
+                "Timed out waiting for last_token_id from prefill for "
+                "request %s. Proceeding without it — reasoning_content "
+                "may be empty for reasoning models.",
+                request.request_id,
+            )
 
     _original_update_waiting_for_remote_kv(self, request)
 

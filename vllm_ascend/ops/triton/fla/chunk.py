@@ -26,6 +26,44 @@ from .l2norm import l2norm_fwd
 from .utils import input_guard, prepare_final_chunk_indices
 
 
+def _build_chunk_offsets_idx_from_cu_seqlens(
+    cu_seqlens: torch.Tensor,
+    chunk_size: int,
+) -> torch.Tensor:
+    """Build chunk_offsets_idx from cu_seqlens when prebuilt_meta is unavailable.
+
+    This produces the same tensor as _fill_chunk_offsets_idx_cpu/_device in
+    gdn_attn_builder.py, but is computed on-the-fly as a fallback.
+    """
+    cu_seqlens_cpu = cu_seqlens.cpu() if cu_seqlens.device.type != "cpu" else cu_seqlens
+    # Compute total number of chunks to determine output size
+    seq_lens = cu_seqlens_cpu[1:] - cu_seqlens_cpu[:-1]
+    chunk_counts = (seq_lens + chunk_size - 1) // chunk_size
+    num_chunks = int(chunk_counts.sum().item())
+
+    out = torch.empty(num_chunks + 1, dtype=torch.int32, device=cu_seqlens.device)
+    # Fill on CPU then copy to device (same pattern as _fill_chunk_offsets_idx_device)
+    out_cpu = torch.empty(num_chunks + 1, dtype=torch.int32)
+    seq_idx = 0
+    last_seqlens = 0
+    out_cpu[0] = 0
+    idx = 1
+    for _, seqlens in enumerate(cu_seqlens_cpu[1:].tolist()):
+        if seqlens == last_seqlens:
+            continue
+        else:
+            last_seqlens = seqlens
+        while seq_idx + chunk_size < seqlens:
+            seq_idx += chunk_size
+            out_cpu[idx] = seq_idx
+            idx += 1
+        seq_idx = seqlens
+        out_cpu[idx] = seq_idx
+        idx += 1
+    out[:idx].copy_(out_cpu[:idx])
+    return out
+
+
 def chunk_gated_delta_rule_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -55,6 +93,10 @@ def chunk_gated_delta_rule_fwd(
     final_chunk_indices_chunk64 = None if prebuilt_meta is None else prebuilt_meta.final_chunk_indices_chunk64
     chunk_indices_large_block = None if prebuilt_meta is None else prebuilt_meta.chunk_indices_large_block
     chunk_offsets_idx = None if prebuilt_meta is None else prebuilt_meta.chunk_offsets_idx
+    # Fallback: build chunk_offsets_idx from cu_seqlens when prebuilt_meta is
+    # unavailable (e.g., cudagraph capture path or non-Ascend builder path).
+    if chunk_offsets_idx is None and cu_seqlens is not None:
+        chunk_offsets_idx = _build_chunk_offsets_idx_from_cu_seqlens(cu_seqlens, chunk_size)
     g = chunk_local_cumsum(
         g,
         chunk_size=chunk_size,

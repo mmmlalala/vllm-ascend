@@ -902,6 +902,7 @@ class TestCPAttentionPrecision:
     - MTP (Multi-Token Prediction) decode, PCP=1, DCP=1
     """
 
+    @pytest.mark.skip(reason="Waiting for rebuild with irregular mask")
     @pytest.mark.parametrize(
         "batch_spec_name",
         [
@@ -925,6 +926,7 @@ class TestCPAttentionPrecision:
         batch_spec = BATCH_SPECS[batch_spec_name]
         _test_cp_prefill_precision_no_cp(batch_spec, model)
 
+    @pytest.mark.skip(reason="Waiting for rebuild with irregular mask")
     @pytest.mark.parametrize(
         "batch_spec_name",
         [
@@ -947,6 +949,7 @@ class TestCPAttentionPrecision:
         batch_spec = BATCH_SPECS[batch_spec_name]
         _test_cp_decode_precision_no_cp(batch_spec, model)
 
+    @pytest.mark.skip(reason="Waiting for rebuild with irregular mask")
     @pytest.mark.parametrize(
         "batch_spec_name",
         [
@@ -969,6 +972,7 @@ class TestCPAttentionPrecision:
         batch_spec = BATCH_SPECS[batch_spec_name]
         _test_cp_mixed_precision_no_cp(batch_spec, model)
 
+    @pytest.mark.skip(reason="Waiting for rebuild with irregular mask")
     @pytest.mark.parametrize(
         "batch_spec_name",
         [

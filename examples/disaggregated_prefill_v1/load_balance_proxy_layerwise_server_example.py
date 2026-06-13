@@ -353,10 +353,11 @@ async def send_request_to_service(
         try:
             response = await client.post(endpoint, json=req_data, headers=headers)
             response.raise_for_status()
+            response_json = response.json()
             if request_id in proxy_state.req_id_future:
                 result_future = proxy_state.req_id_future[request_id]
-                result_future.set_result(response.json()["kv_transfer_params"])
-            return
+                result_future.set_result(response_json.get("kv_transfer_params"))
+            return response_json.get("kv_transfer_params")
         except (httpx.RequestError, httpx.HTTPStatusError) as e:
             logger.warning("Attempt %s failed for %s: %s", attempt, endpoint, e)
             last_exc = e
@@ -592,8 +593,8 @@ async def metaserver(request: Request):
         prefiller_idx = proxy_state.select_prefiller(prefiller_score)
         prefiller = proxy_state.prefillers[prefiller_idx]
         logger.debug("Using prefill prefiller.url=%r req_data=%r", prefiller.url, req_data)
-        # Send request to prefiller
-        await send_request_to_service(
+        # Send request to prefiller and return kv_transfer_params
+        result = await send_request_to_service(
             prefiller.client,
             prefiller_idx,
             api,
@@ -602,6 +603,7 @@ async def metaserver(request: Request):
             max_retries=global_args.max_retries,
             base_delay=global_args.retry_delay,
         )
+        return result
 
     except Exception as e:
         logger.error("Post metaserver failed with: %s", e)

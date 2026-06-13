@@ -886,15 +886,34 @@ class MooncakeLayerwiseConnectorScheduler:
                 remote_cached_tokens=remote_cached_tokens,
             )
             if not do_virtual:
+                req = request  # capture for callback closure
+
                 future = self.executor.submit(
                     self._access_metaserver, url=params.get("metaserver", None), message=kv_transfer_params
                 )
 
-                def handle_exception(future):
+                def handle_metaserver_response(future):
                     if future.exception():
                         logger.error("Access metaserver fail: %s", future.exception())
+                        return
+                    try:
+                        response = future.result()
+                        if response is not None and response.status_code == 200:
+                            result = response.json()
+                            if result and "last_token_id" in result:
+                                # Store last_token_id from the prefill instance
+                                # in the request's kv_transfer_params so that
+                                # the decode scheduler can use it.
+                                req.kv_transfer_params["last_token_id"] = result["last_token_id"]
+                                logger.info(
+                                    "Received last_token_id=%s from prefill for request %s",
+                                    result["last_token_id"],
+                                    req.request_id,
+                                )
+                    except Exception as e:
+                        logger.error("Failed to process metaserver response: %s", e)
 
-                future.add_done_callback(handle_exception)
+                future.add_done_callback(handle_metaserver_response)
 
         # Layerwise prefiller add request need send
         if params is not None and params.get("do_remote_decode"):
@@ -1004,15 +1023,17 @@ class MooncakeLayerwiseConnectorScheduler:
     def _access_metaserver(self, url, message):
         success = False
         retry = 0
+        response = None
         while retry < 3 and success is False:
             retry += 1
             try:
-                self.metaserver_client.post(url, json=message)
+                response = self.metaserver_client.post(url, json=message)
                 success = True
             except Exception as e:
                 logger.error("Failed to connect to metaserver: %s, retry %s time.", url, retry)
                 if retry == 3:
                     raise e
+        return response
 
     def request_finished(
         self,
@@ -1024,6 +1045,8 @@ class MooncakeLayerwiseConnectorScheduler:
         should be freed now or will be sent asynchronously and freed later.
         """
         # layer_wise push, not need delay_free_blocks
+        if self.vllm_config.kv_transfer_config.is_kv_producer and request.output_token_ids:
+            return False, {"last_token_id": request.output_token_ids[-1]}
         return False, None
 
     def request_finished_all_groups(
@@ -1036,6 +1059,11 @@ class MooncakeLayerwiseConnectorScheduler:
         should be freed now or will be sent asynchronously and freed later.
         """
         # layer_wise push, not need delay_free_blocks
+        # Return last_token_id for kv_producer so that the decode instance
+        # can preserve the prefill instance's generated token, which is
+        # critical for reasoning models (e.g. Qwen3.5 with enable_thinking).
+        if self.vllm_config.kv_transfer_config.is_kv_producer and request.output_token_ids:
+            return False, {"last_token_id": request.output_token_ids[-1]}
         return False, None
 
 

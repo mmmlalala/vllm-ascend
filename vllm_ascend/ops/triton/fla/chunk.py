@@ -16,15 +16,14 @@ from vllm.distributed import get_pcp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fla.ops.utils import SUPPRESS_LEVEL
 
+import cloud_ops_turbo
+
 from .chunk_delta_h import chunk_gated_delta_rule_fwd_h  # noqa: F401
 from .chunk_delta_hupdate import chunk_gated_delta_rule_fwd_hupdate
 from .chunk_o import chunk_fwd_o  # noqa: F401
-from .chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from .cumsum import chunk_local_cumsum
 from .l2norm import l2norm_fwd
-from .solve_tril import solve_tril
 from .utils import input_guard, prepare_final_chunk_indices
-from .wy_fast import recompute_w_u_fwd
 
 
 def chunk_gated_delta_rule_fwd(
@@ -55,6 +54,7 @@ def chunk_gated_delta_rule_fwd(
     update_chunk_offsets_chunk64 = None if prebuilt_meta is None else prebuilt_meta.update_chunk_offsets_chunk64
     final_chunk_indices_chunk64 = None if prebuilt_meta is None else prebuilt_meta.final_chunk_indices_chunk64
     chunk_indices_large_block = None if prebuilt_meta is None else prebuilt_meta.chunk_indices_large_block
+    chunk_offsets_idx = None if prebuilt_meta is None else prebuilt_meta.chunk_offsets_idx
     g = chunk_local_cumsum(
         g,
         chunk_size=chunk_size,
@@ -62,30 +62,20 @@ def chunk_gated_delta_rule_fwd(
         block_indices=block_indices_cumsum,
     )
     # obtain WY representation. u is actually the new v.
-    A = chunk_scaled_dot_kkt_fwd(
-        k=k,
-        beta=beta,
-        g_cumsum=g,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices_chunk64,
-        output_dtype=torch.float32,
+    beta_bht = beta.transpose(1, 2).contiguous()
+    g_bht = g.transpose(1, 2).contiguous()
+
+    A = torch.ops.cloud_ops_turbo.cloud_chunk_scaled_dot_kkt(
+        k, beta_bht, g_bht, chunk_offsets_idx, chunk_size=chunk_size,
     )
-    A = solve_tril(
-        A=A,
-        cu_seqlens=cu_seqlens,
-        chunk_indices_large_block=chunk_indices_large_block,
-        chunk_indices_bt=chunk_indices_chunk64,
-        output_dtype=k.dtype,
+    A = torch.ops.cloud_ops_turbo.cloud_solve_tril(A, chunk_offsets_idx)
+    w, u = torch.ops.cloud_ops_turbo.cloud_recompute_wu(
+        k, v, A, beta_bht, g_bht, chunk_offsets_idx,
     )
-    w, u = recompute_w_u_fwd(
-        k=k,
-        v=v,
-        beta=beta,
-        A=A,
-        g_cumsum=g,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices_chunk64,
-    )
+    # cloud_recompute_wu returns w: [B, H, T, K], u: [B, H, T, V] (head-first).
+    # Transpose to [B, T, H, K/V] (time-first) for downstream Triton kernels.
+    w = w.transpose(1, 2).contiguous()
+    u = u.transpose(1, 2).contiguous()
 
     k_ascendc = k.to(torch.bfloat16).transpose(1, 2).contiguous()
     w_ascendc = w.to(torch.bfloat16).transpose(1, 2).contiguous()

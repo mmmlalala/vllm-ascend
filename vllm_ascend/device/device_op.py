@@ -373,7 +373,7 @@ class BaseDeviceAdaptor:
         return x
 
     @staticmethod
-    def fused_gdn_gating(A_log, a, b, dt_bias):
+    def fused_gdn_gating(A_log: torch.Tensor, a: torch.Tensor, b: torch.Tensor, dt_bias: torch.Tensor):
         return torch.ops._C_ascend.npu_fused_gdn_gating(A_log, a, b, dt_bias.to(torch.float32))
 
 
@@ -783,7 +783,7 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         return x
 
     @staticmethod
-    def fused_gdn_gating(A_log, a, b, dt_bias):
+    def fused_gdn_gating(A_log: torch.Tensor, a: torch.Tensor, b: torch.Tensor, dt_bias: torch.Tensor):
         # A5 lacks the npu_fused_gdn_gating custom op (registered only for
         # ascend910b/ascend910_93 in PR #9601), so fall back to the Triton
         # kernel, which casts dt_bias to fp32 internally.

@@ -70,7 +70,7 @@ def chunk_gated_delta_rule_fwd(
     )
     A = torch.ops.cloud_ops_turbo.cloud_solve_tril(A, chunk_offsets_idx)
     w, u = torch.ops.cloud_ops_turbo.cloud_recompute_wu(
-        k, v, A, beta_bht, g_bht, chunk_offsets_idx,
+        k, v, A, beta_bht, g_bht, chunk_offsets_idx, chunk_size=chunk_size,
     )
     # cloud_recompute_wu returns w: [B, H, T, K], u: [B, H, T, V] (head-first).
     # Transpose to [B, T, H, K/V] (time-first) for downstream Triton kernels.

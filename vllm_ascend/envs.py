@@ -112,6 +112,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
     # Whether to use MultiBlockPool for KV cache management
     "VLLM_ASCEND_APPLY_DSV4_PATCH": lambda: bool(int(os.getenv("VLLM_ASCEND_APPLY_DSV4_PATCH", "0"))),
+    # Whether to disable cloud_ops_turbo custom AscendC operators and fall back
+    # to Triton implementations. Set to 1 to use legacy Triton path for debugging.
+    # Each operator can be individually controlled:
+    #   0: use cloud_ops_turbo (default)
+    #   1: disable all three operators
+    "VLLM_ASCEND_DISABLE_CLOUD_OPS_TURBO": lambda: bool(int(os.getenv("VLLM_ASCEND_DISABLE_CLOUD_OPS_TURBO", "0"))),
 }
 
 # end-env-vars-definition

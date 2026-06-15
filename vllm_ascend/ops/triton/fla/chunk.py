@@ -8,6 +8,7 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # ruff: noqa: E501
 # mypy: ignore-errors
+import logging
 import warnings
 
 import torch
@@ -16,12 +17,16 @@ from vllm.distributed import get_pcp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fla.ops.utils import SUPPRESS_LEVEL
 
+from vllm_ascend import envs
+
 from .chunk_delta_h import chunk_gated_delta_rule_fwd_h  # noqa: F401
 from .chunk_delta_hupdate import chunk_gated_delta_rule_fwd_hupdate
 from .chunk_o import chunk_fwd_o  # noqa: F401
 from .cumsum import chunk_local_cumsum
 from .l2norm import l2norm_fwd
 from .utils import input_guard, prepare_final_chunk_indices
+
+logger = logging.getLogger(__name__)
 
 
 def _build_chunk_offsets_idx_from_cu_seqlens(
@@ -82,7 +87,7 @@ def chunk_gated_delta_rule_fwd(
     if attn_metadata is not None:
         num_decodes = attn_metadata.num_decodes
     chunk_size = 64
-    import cloud_ops_turbo  # Lazy import to avoid loading SO at module import time
+    use_cloud_ops = not envs.VLLM_ASCEND_DISABLE_CLOUD_OPS_TURBO
     block_indices_cumsum = None if prebuilt_meta is None else prebuilt_meta.block_indices_cumsum
     cu_seqlens_host = None if prebuilt_meta is None else prebuilt_meta.cu_seqlens_host
     chunk_indices_chunk64 = None if prebuilt_meta is None else prebuilt_meta.chunk_indices_chunk64
@@ -103,24 +108,68 @@ def chunk_gated_delta_rule_fwd(
         block_indices=block_indices_cumsum,
     )
     # obtain WY representation. u is actually the new v.
-    beta_bht = beta.transpose(1, 2).contiguous()
-    g_bht = g.transpose(1, 2).contiguous()
+    if use_cloud_ops:
+        import cloud_ops_turbo  # Lazy import to avoid loading SO at module import time
+        beta_bht = beta.transpose(1, 2).contiguous()
+        g_bht = g.transpose(1, 2).contiguous()
 
-    A = torch.ops.cloud_ops_turbo.cloud_chunk_scaled_dot_kkt(
-        k, beta_bht, g_bht, chunk_offsets_idx, chunk_size=chunk_size,
-    )
-    A = torch.ops.cloud_ops_turbo.cloud_solve_tril(A, chunk_offsets_idx)
-    w, u = torch.ops.cloud_ops_turbo.cloud_recompute_wu(
-        k, v, A, beta_bht, g_bht, chunk_offsets_idx, chunk_size=chunk_size,
-    )
-    # cloud_ops_turbo custom AscendC operators may use internal CANN streams
-    # not ordered with the default PyTorch NPU stream. Synchronize to ensure
-    # outputs are ready before downstream ops.
-    torch.npu.synchronize()
-    # cloud_recompute_wu returns w: [B, H, T, K], u: [B, H, T, V] (head-first).
-    # Transpose to [B, T, H, K/V] (time-first) for downstream Triton kernels.
-    w = w.transpose(1, 2).contiguous()
-    u = u.transpose(1, 2).contiguous()
+        logger.info("[cloud_ops_turbo] cloud_chunk_scaled_dot_kkt START")
+        A = torch.ops.cloud_ops_turbo.cloud_chunk_scaled_dot_kkt(
+            k, beta_bht, g_bht, chunk_offsets_idx, chunk_size=chunk_size,
+        )
+        logger.info("[cloud_ops_turbo] cloud_chunk_scaled_dot_kkt END")
+
+        logger.info("[cloud_ops_turbo] cloud_solve_tril START")
+        A = torch.ops.cloud_ops_turbo.cloud_solve_tril(A, chunk_offsets_idx)
+        logger.info("[cloud_ops_turbo] cloud_solve_tril END")
+
+        logger.info("[cloud_ops_turbo] cloud_recompute_wu START")
+        w, u = torch.ops.cloud_ops_turbo.cloud_recompute_wu(
+            k, v, A, beta_bht, g_bht, chunk_offsets_idx, chunk_size=chunk_size,
+        )
+        logger.info("[cloud_ops_turbo] cloud_recompute_wu END")
+
+        # cloud_recompute_wu returns w: [B, H, T, K], u: [B, H, T, V] (head-first).
+        # Transpose to [B, T, H, K/V] (time-first) for downstream Triton kernels.
+        w = w.transpose(1, 2).contiguous()
+        u = u.transpose(1, 2).contiguous()
+    else:
+        from .chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
+        from .solve_tril import solve_tril
+        from .wy_fast import recompute_w_u_fwd
+
+        logger.info("[triton_fallback] chunk_scaled_dot_kkt_fwd START")
+        A = chunk_scaled_dot_kkt_fwd(
+            k=k,
+            beta=beta,
+            g_cumsum=g,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices_chunk64,
+            output_dtype=torch.float32,
+        )
+        logger.info("[triton_fallback] chunk_scaled_dot_kkt_fwd END")
+
+        logger.info("[triton_fallback] solve_tril START")
+        A = solve_tril(
+            A=A,
+            cu_seqlens=cu_seqlens,
+            chunk_indices_large_block=chunk_indices_large_block,
+            chunk_indices_bt=chunk_indices_chunk64,
+            output_dtype=k.dtype,
+        )
+        logger.info("[triton_fallback] solve_tril END")
+
+        logger.info("[triton_fallback] recompute_w_u_fwd START")
+        w, u = recompute_w_u_fwd(
+            k=k,
+            v=v,
+            beta=beta,
+            A=A,
+            g_cumsum=g,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices_chunk64,
+        )
+        logger.info("[triton_fallback] recompute_w_u_fwd END")
 
     k_ascendc = k.to(torch.bfloat16).transpose(1, 2).contiguous()
     w_ascendc = w.to(torch.bfloat16).transpose(1, 2).contiguous()

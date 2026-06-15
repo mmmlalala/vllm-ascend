@@ -118,6 +118,7 @@ def chunk_gated_delta_rule_fwd(
                 return "None"
             return f"shape={tuple(t.shape)}, dtype={t.dtype}, device={t.device}"
 
+        print(f"[cloud_ops_turbo] cloud ops {chunk_offsets_idx=}")
         print(f"[cloud_ops_turbo] cloud_chunk_scaled_dot_kkt START "
               f"k={_tensor_info(k)} beta_bht={_tensor_info(beta_bht)} "
               f"g_bht={_tensor_info(g_bht)} chunk_offsets_idx={_tensor_info(chunk_offsets_idx)} "

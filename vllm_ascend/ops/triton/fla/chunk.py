@@ -114,20 +114,26 @@ def chunk_gated_delta_rule_fwd(
         g_bht = g.transpose(1, 2).contiguous()
 
         logger.info("[cloud_ops_turbo] cloud_chunk_scaled_dot_kkt START")
+        print("[cloud_ops_turbo] cloud_chunk_scaled_dot_kkt START", flush=True)
         A = torch.ops.cloud_ops_turbo.cloud_chunk_scaled_dot_kkt(
             k, beta_bht, g_bht, chunk_offsets_idx, chunk_size=chunk_size,
         )
         logger.info("[cloud_ops_turbo] cloud_chunk_scaled_dot_kkt END")
+        print("[cloud_ops_turbo] cloud_chunk_scaled_dot_kkt END", flush=True)
 
         logger.info("[cloud_ops_turbo] cloud_solve_tril START")
+        print("[cloud_ops_turbo] cloud_solve_tril START", flush=True)
         A = torch.ops.cloud_ops_turbo.cloud_solve_tril(A, chunk_offsets_idx)
         logger.info("[cloud_ops_turbo] cloud_solve_tril END")
+        print("[cloud_ops_turbo] cloud_solve_tril END", flush=True)
 
         logger.info("[cloud_ops_turbo] cloud_recompute_wu START")
+        print("[cloud_ops_turbo] cloud_recompute_wu START", flush=True)
         w, u = torch.ops.cloud_ops_turbo.cloud_recompute_wu(
             k, v, A, beta_bht, g_bht, chunk_offsets_idx, chunk_size=chunk_size,
         )
         logger.info("[cloud_ops_turbo] cloud_recompute_wu END")
+        print("[cloud_ops_turbo] cloud_recompute_wu END", flush=True)
 
         # cloud_recompute_wu returns w: [B, H, T, K], u: [B, H, T, V] (head-first).
         # Transpose to [B, T, H, K/V] (time-first) for downstream Triton kernels.
@@ -139,6 +145,7 @@ def chunk_gated_delta_rule_fwd(
         from .wy_fast import recompute_w_u_fwd
 
         logger.info("[triton_fallback] chunk_scaled_dot_kkt_fwd START")
+        print("[triton_fallback] chunk_scaled_dot_kkt_fwd START", flush=True)
         A = chunk_scaled_dot_kkt_fwd(
             k=k,
             beta=beta,
@@ -148,8 +155,10 @@ def chunk_gated_delta_rule_fwd(
             output_dtype=torch.float32,
         )
         logger.info("[triton_fallback] chunk_scaled_dot_kkt_fwd END")
+        print("[triton_fallback] chunk_scaled_dot_kkt_fwd END", flush=True)
 
         logger.info("[triton_fallback] solve_tril START")
+        print("[triton_fallback] solve_tril START", flush=True)
         A = solve_tril(
             A=A,
             cu_seqlens=cu_seqlens,
@@ -158,8 +167,10 @@ def chunk_gated_delta_rule_fwd(
             output_dtype=k.dtype,
         )
         logger.info("[triton_fallback] solve_tril END")
+        print("[triton_fallback] solve_tril END", flush=True)
 
         logger.info("[triton_fallback] recompute_w_u_fwd START")
+        print("[triton_fallback] recompute_w_u_fwd START", flush=True)
         w, u = recompute_w_u_fwd(
             k=k,
             v=v,
@@ -170,6 +181,7 @@ def chunk_gated_delta_rule_fwd(
             chunk_indices=chunk_indices_chunk64,
         )
         logger.info("[triton_fallback] recompute_w_u_fwd END")
+        print("[triton_fallback] recompute_w_u_fwd END", flush=True)
 
     k_ascendc = k.to(torch.bfloat16).transpose(1, 2).contiguous()
     w_ascendc = w.to(torch.bfloat16).transpose(1, 2).contiguous()

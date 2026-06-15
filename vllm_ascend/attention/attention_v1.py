@@ -302,35 +302,6 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         elif self.speculative_config and self.speculative_config.parallel_drafting:
             seq_lens = common_attn_metadata.seq_lens
 
-        # [DFLASH_DIAG] Log attention metadata for DFlash debugging
-        if self.speculative_config and self.speculative_config.parallel_drafting:
-            from vllm.logger import logger as _logger
-            _seq_lens_cpu_val = (common_attn_metadata._seq_lens_cpu[:num_reqs].tolist()
-                                 if common_attn_metadata._seq_lens_cpu is not None else None)
-            _seq_lens_cpu_src = "_seq_lens_cpu"
-            if common_attn_metadata._seq_lens_cpu is None and common_attn_metadata.seq_lens_cpu is not None:
-                _seq_lens_cpu_val = common_attn_metadata.seq_lens_cpu[:num_reqs].tolist()
-                _seq_lens_cpu_src = "seq_lens_cpu"
-            elif common_attn_metadata._seq_lens_cpu is None and common_attn_metadata.seq_lens_cpu is None:
-                _seq_lens_cpu_val = "None_both"
-                _seq_lens_cpu_src = "fallback_to_gpu"
-            _logger.info(
-                "[DFLASH_DIAG] build(): attn_state=%s, causal=%s, "
-                "seq_lens(from parallel_drafting GPU)=%s, "
-                "_seq_lens_cpu(src=%s)=%s, "
-                "actual_seq_lengths_q=%s, seq_lens_list=%s, "
-                "num_reqs=%d, num_actual_tokens=%d",
-                common_attn_metadata.attn_state,
-                common_attn_metadata.causal,
-                seq_lens[:num_reqs].tolist() if hasattr(seq_lens, 'tolist') else seq_lens,
-                _seq_lens_cpu_src,
-                _seq_lens_cpu_val,
-                query_start_loc_cpu[1:].tolist(),
-                seq_lens.tolist() if hasattr(seq_lens, 'tolist') else "N/A",
-                num_reqs,
-                num_actual_tokens,
-            )
-
         attn_state = common_attn_metadata.attn_state
 
         # Get attn_mask from singleton AttentionMaskBuilder
@@ -1139,6 +1110,26 @@ class AscendAttentionBackendImpl(AttentionImpl):
             )
         else:
             if not attn_metadata.causal:
+                # [DFLASH_DIAG] Log FIA inputs for non-causal (DFlash) path
+                from vllm.logger import logger as _fia_logger
+                _layer_idx = getattr(self, 'layerIndex', -1)
+                _bt_sample = block_table[0, :5].tolist() if block_table is not None else None
+                _fia_logger.info(
+                    "[DFLASH_DIAG] FIA non-causal: layer_idx=%s, "
+                    "query_shape=%s, key_shape=%s, value_shape=%s, "
+                    "block_table_shape=%s, block_table[0,:5]=%s, block_size=%d, "
+                    "actual_seq_lengths_q=%s, actual_seq_lengths_kv=%s, "
+                    "num_kv_heads=%d, num_heads=%d, scale=%.6f, "
+                    "query_norm=%.4f, key_norm=%.4f, value_norm=%.4f",
+                    _layer_idx,
+                    list(query.shape), list(key.shape), list(value.shape),
+                    list(block_table.shape) if block_table is not None else None,
+                    _bt_sample, block_size,
+                    attn_metadata.actual_seq_lengths_q,
+                    actual_seq_lengths_kv,
+                    self.num_kv_heads, self.num_heads, self.scale,
+                    query.norm().item(), key.norm().item(), value.norm().item(),
+                )
                 attn_output, _ = torch_npu.npu_fused_infer_attention_score(
                     query=query,
                     key=key,
@@ -1152,6 +1143,15 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     num_heads=self.num_heads,
                     scale=self.scale,
                     sparse_mode=0,
+                )
+                # [DFLASH_DIAG] Log FIA output
+                _fia_logger.info(
+                    "[DFLASH_DIAG] FIA non-causal output: layer_idx=%s, "
+                    "output_shape=%s, output_norm=%.4f, output_has_nan=%s",
+                    _layer_idx,
+                    list(attn_output.shape),
+                    attn_output.norm().item(),
+                    torch.isnan(attn_output).any().item(),
                 )
             elif self.sliding_window is not None:
                 attn_output, _ = torch_npu.npu_fused_infer_attention_score(
@@ -1271,6 +1271,24 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
             slots = attn_metadata.slot_mapping
             encoder_decoder = self.attn_type == AttentionType.ENCODER_DECODER
+            # [DFLASH_DIAG] Log reshape_and_cache for non-causal (DFlash) path
+            if not attn_metadata.causal:
+                from vllm.logger import logger as _rc_logger
+                _layer_idx = getattr(self, 'layerIndex', -1)
+                used_slots = slots[: attn_metadata.num_actual_tokens] if not encoder_decoder else slots
+                _rc_logger.info(
+                    "[DFLASH_DIAG] reshape_and_cache: layer_idx=%s, causal=False, "
+                    "key_shape=%s, value_shape=%s, "
+                    "slot_mapping[:5]=%s, slot_mapping_dtype=%s, "
+                    "num_actual_tokens=%d, key_norm=%.4f, value_norm=%.4f",
+                    _layer_idx,
+                    list(key.shape), list(value.shape),
+                    used_slots[:5].tolist() if not encoder_decoder else "enc_dec",
+                    used_slots.dtype,
+                    attn_metadata.num_actual_tokens,
+                    key[:attn_metadata.num_actual_tokens].norm().item() if not encoder_decoder else key.norm().item(),
+                    value[:attn_metadata.num_actual_tokens].norm().item() if not encoder_decoder else value.norm().item(),
+                )
             DeviceOperator.reshape_and_cache(
                 key=key[: attn_metadata.num_actual_tokens] if not encoder_decoder else key,
                 value=value[: attn_metadata.num_actual_tokens] if not encoder_decoder else value,
@@ -1330,6 +1348,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
         """
         assert output is not None, "Output tensor must be provided."
         if self.enable_hamming_sparse:
+            self.layerIndex = int(layer.layer_name.split(".")[2])
+        elif not hasattr(self, 'layerIndex'):
             self.layerIndex = int(layer.layer_name.split(".")[2])
 
         if output_scale is not None or output_block_scale is not None:

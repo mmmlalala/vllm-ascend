@@ -19,19 +19,6 @@ def precompute_and_store_context_kv(
     hd = self._head_dim
     nkv = self._num_kv_heads
 
-    # [DFLASH_DIAG] Log input metadata
-    logger.info(
-        "[DFLASH_DIAG] precompute_kv: num_ctx=%d, L=%d, "
-        "context_states_shape=%s, context_states_dtype=%s, "
-        "context_positions[:5]=%s, "
-        "slot_mapping[:5]=%s, slot_mapping_dtype=%s",
-        num_ctx, L,
-        list(context_states.shape), context_states.dtype,
-        context_positions[:5].tolist(),
-        context_slot_mapping[:5].tolist() if context_slot_mapping is not None else None,
-        context_slot_mapping.dtype if context_slot_mapping is not None else None,
-    )
-
     # --- Fused KV projection (one GEMM for all layers) ---
     normed_context_states = self.hidden_norm(context_states)
     all_kv_flat = F.linear(normed_context_states, self._fused_kv_weight, self._fused_kv_bias)
@@ -70,6 +57,37 @@ def precompute_and_store_context_kv(
             all_v[i],
             kv_cache,
             context_slot_mapping,
+        )
+
+    # [DFLASH_DIAG] Verify KV cache write: read back key_cache at the
+    # written slots and compare with the K we just wrote.
+    # Only check layer 0 to keep overhead low.
+    key_cache = self._attn_layers[0].impl.key_cache
+    if key_cache is not None:
+        block_size = key_cache.shape[1]
+        slots = context_slot_mapping[:min(num_ctx, 5)]
+        block_ids = slots // block_size
+        block_offsets = slots % block_size
+        # Read back the first few slots from key_cache
+        readback_vals = []
+        for s_idx in range(slots.shape[0]):
+            bid = block_ids[s_idx].item()
+            boff = block_offsets[s_idx].item()
+            # key_cache shape: [num_blocks, block_size, nkv, hd]
+            readback_k = key_cache[bid, boff, :, :].detach().cpu()
+            expected_k = all_k_final[0, s_idx, :, :].detach().cpu()
+            diff_norm = (readback_k - expected_k).norm().item()
+            readback_vals.append(
+                "slot=%d:block=%d:off=%d:diff_norm=%.6f"
+                % (slots[s_idx].item(), bid, boff, diff_norm)
+            )
+        logger.info(
+            "[DFLASH_DIAG] precompute_kv cache_verify: num_ctx=%d, L=%d, "
+            "slot_mapping[:5]=%s, slot_dtype=%s, cache_readback=[%s]",
+            num_ctx, L,
+            context_slot_mapping[:5].tolist(),
+            context_slot_mapping.dtype,
+            ", ".join(readback_vals),
         )
 
 

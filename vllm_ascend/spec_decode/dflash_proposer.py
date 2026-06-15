@@ -147,25 +147,16 @@ class AscendDflashProposer(AscendEagleProposer):
         cad.attn_mask = None
         cad.attn_state = AscendAttentionState.ChunkedPrefill
 
-        # [DFLASH_DIAG] Log key metadata fields for first-request repetition debugging
-        new_seq_lens = effective_seq_lens + num_query_per_req
+        # [DFLASH_DIAG]
         logger.info(
             "[DFLASH_DIAG] set_inputs_first_pass: batch_size=%d, num_context=%d, "
             "num_query_total=%d, has_num_rejected=%s, "
-            "cad._seq_lens_cpu=%s, cad.seq_lens_cpu=%s, "
-            "cad.seq_lens(GPU before)=%s, new_seq_lens(GPU after)=%s, "
-            "cad._num_computed_tokens_cpu=%s, cad.num_computed_tokens_cpu=%s, "
-            "cad.attn_state=%s, cad.causal=%s",
+            "seq_lens(GPU after)=%s, causal=%s, attn_state=%s",
             batch_size, num_context, num_query_total,
             has_num_rejected,
-            cad._seq_lens_cpu[:batch_size].tolist() if cad._seq_lens_cpu is not None else None,
-            cad.seq_lens_cpu[:batch_size].tolist() if cad.seq_lens_cpu is not None else None,
-            effective_seq_lens[:batch_size].tolist(),
-            new_seq_lens[:batch_size].tolist(),
-            cad._num_computed_tokens_cpu[:batch_size].tolist() if cad._num_computed_tokens_cpu is not None else None,
-            cad.num_computed_tokens_cpu[:batch_size].tolist() if cad.num_computed_tokens_cpu is not None else None,
-            cad.attn_state,
+            (effective_seq_lens + num_query_per_req)[:batch_size].tolist(),
             cad.causal,
+            cad.attn_state,
         )
 
         return num_query_total, token_indices_to_sample, cad, None

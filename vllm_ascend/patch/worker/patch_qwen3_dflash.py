@@ -4,6 +4,16 @@ from vllm.logger import logger
 from vllm.model_executor.models.qwen3_dflash import DFlashQwen3Model
 
 
+def _safe_tensor_stat(t: torch.Tensor, name: str) -> str:
+    """Compute norm/nan stats on NPU safely; catch device errors."""
+    try:
+        n = t.float().norm().item()
+        has_nan = torch.isnan(t).any().item()
+        return f"{name}_norm={n:.4f}, {name}_has_nan={has_nan}"
+    except Exception as e:
+        return f"{name}_stat_err={e}"
+
+
 def precompute_and_store_context_kv(
     self,
     context_states: torch.Tensor,
@@ -42,16 +52,13 @@ def precompute_and_store_context_kv(
     positions_repeated = context_positions.repeat(L)
     tmpv = all_k_flat.clone()
     # [DFLASH_DIAG] Log K norm before RoPE
-    k_norm_before = all_k_flat.norm().item()
+    k_stat_before = _safe_tensor_stat(all_k_flat, "k_before_rope")
     self.layers[0].self_attn.rotary_emb(positions_repeated, all_k_flat, tmpv)
     # [DFLASH_DIAG] Log K norm after RoPE to verify it was applied in-place
-    k_norm_after = all_k_flat.norm().item()
+    k_stat_after = _safe_tensor_stat(all_k_flat, "k_after_rope")
     logger.info(
-        "[DFLASH_DIAG] precompute_kv RoPE: num_ctx=%d, L=%d, "
-        "k_norm_before=%.4f, k_norm_after=%.4f, changed=%s",
-        num_ctx, L,
-        k_norm_before, k_norm_after,
-        abs(k_norm_before - k_norm_after) > 0.001,
+        "[DFLASH_DIAG] precompute_kv RoPE: num_ctx=%d, L=%d, %s, %s",
+        num_ctx, L, k_stat_before, k_stat_after,
     )
 
     if context_slot_mapping is None:
@@ -64,15 +71,12 @@ def precompute_and_store_context_kv(
         kv_cache = attn.kv_cache
         # [DFLASH_DIAG] Log K/V stats and slot_mapping for first 2 layers
         if i < 2:
+            k_stat = _safe_tensor_stat(all_k_final[i], f"layer{i}_k")
+            v_stat = _safe_tensor_stat(all_v[i], f"layer{i}_v")
             logger.info(
-                "[DFLASH_DIAG] precompute_kv layer %d: k_norm=%.4f, v_norm=%.4f, "
-                "k_has_nan=%s, v_has_nan=%s, "
+                "[DFLASH_DIAG] precompute_kv layer %d: %s, %s, "
                 "slot_mapping[:5]=%s, slot_mapping_dtype=%s",
-                i,
-                all_k_final[i].norm().item(),
-                all_v[i].norm().item(),
-                torch.isnan(all_k_final[i]).any().item(),
-                torch.isnan(all_v[i]).any().item(),
+                i, k_stat, v_stat,
                 context_slot_mapping[:5].tolist(),
                 context_slot_mapping.dtype,
             )
@@ -85,13 +89,10 @@ def precompute_and_store_context_kv(
         )
         # [DFLASH_DIAG] Verify key_cache after write for first 2 layers
         if i < 2 and attn.impl.key_cache is not None:
-            key_cache = attn.impl.key_cache
+            kc_stat = _safe_tensor_stat(attn.impl.key_cache, f"layer{i}_key_cache")
             logger.info(
-                "[DFLASH_DIAG] precompute_kv layer %d after cache write: "
-                "key_cache_norm=%.4f, key_cache_has_nan=%s",
-                i,
-                key_cache.norm().item(),
-                torch.isnan(key_cache).any().item(),
+                "[DFLASH_DIAG] precompute_kv layer %d after cache write: %s",
+                i, kc_stat,
             )
 
 

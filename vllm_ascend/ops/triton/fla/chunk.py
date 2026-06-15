@@ -113,27 +113,33 @@ def chunk_gated_delta_rule_fwd(
         beta_bht = beta.transpose(1, 2).contiguous()
         g_bht = g.transpose(1, 2).contiguous()
 
-        logger.info("[cloud_ops_turbo] cloud_chunk_scaled_dot_kkt START")
-        print("[cloud_ops_turbo] cloud_chunk_scaled_dot_kkt START", flush=True)
+        def _tensor_info(t):
+            if t is None:
+                return "None"
+            return f"shape={tuple(t.shape)}, dtype={t.dtype}, device={t.device}"
+
+        print(f"[cloud_ops_turbo] cloud_chunk_scaled_dot_kkt START "
+              f"k={_tensor_info(k)} beta_bht={_tensor_info(beta_bht)} "
+              f"g_bht={_tensor_info(g_bht)} chunk_offsets_idx={_tensor_info(chunk_offsets_idx)} "
+              f"chunk_size={chunk_size}", flush=True)
         A = torch.ops.cloud_ops_turbo.cloud_chunk_scaled_dot_kkt(
             k, beta_bht, g_bht, chunk_offsets_idx, chunk_size=chunk_size,
         )
-        logger.info("[cloud_ops_turbo] cloud_chunk_scaled_dot_kkt END")
-        print("[cloud_ops_turbo] cloud_chunk_scaled_dot_kkt END", flush=True)
+        print(f"[cloud_ops_turbo] cloud_chunk_scaled_dot_kkt END A={_tensor_info(A)}", flush=True)
 
-        logger.info("[cloud_ops_turbo] cloud_solve_tril START")
-        print("[cloud_ops_turbo] cloud_solve_tril START", flush=True)
+        print(f"[cloud_ops_turbo] cloud_solve_tril START "
+              f"A={_tensor_info(A)} chunk_offsets_idx={_tensor_info(chunk_offsets_idx)}", flush=True)
         A = torch.ops.cloud_ops_turbo.cloud_solve_tril(A, chunk_offsets_idx)
-        logger.info("[cloud_ops_turbo] cloud_solve_tril END")
-        print("[cloud_ops_turbo] cloud_solve_tril END", flush=True)
+        print(f"[cloud_ops_turbo] cloud_solve_tril END A={_tensor_info(A)}", flush=True)
 
-        logger.info("[cloud_ops_turbo] cloud_recompute_wu START")
-        print("[cloud_ops_turbo] cloud_recompute_wu START", flush=True)
+        print(f"[cloud_ops_turbo] cloud_recompute_wu START "
+              f"k={_tensor_info(k)} v={_tensor_info(v)} A={_tensor_info(A)} "
+              f"beta_bht={_tensor_info(beta_bht)} g_bht={_tensor_info(g_bht)} "
+              f"chunk_offsets_idx={_tensor_info(chunk_offsets_idx)} chunk_size={chunk_size}", flush=True)
         w, u = torch.ops.cloud_ops_turbo.cloud_recompute_wu(
             k, v, A, beta_bht, g_bht, chunk_offsets_idx, chunk_size=chunk_size,
         )
-        logger.info("[cloud_ops_turbo] cloud_recompute_wu END")
-        print("[cloud_ops_turbo] cloud_recompute_wu END", flush=True)
+        print(f"[cloud_ops_turbo] cloud_recompute_wu END w={_tensor_info(w)} u={_tensor_info(u)}", flush=True)
 
         # cloud_recompute_wu returns w: [B, H, T, K], u: [B, H, T, V] (head-first).
         # Transpose to [B, T, H, K/V] (time-first) for downstream Triton kernels.

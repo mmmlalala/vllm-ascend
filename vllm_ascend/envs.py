@@ -112,6 +112,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
     # Whether to use MultiBlockPool for KV cache management
     "VLLM_ASCEND_APPLY_DSV4_PATCH": lambda: bool(int(os.getenv("VLLM_ASCEND_APPLY_DSV4_PATCH", "0"))),
+    # Number of low-numbered KV cache blocks to skip on Ascend NPU.
+    # Low-numbered blocks may contain stale device memory that corrupts
+    # FIA attention output, causing token repetition on the first request.
+    # Setting this to N reserves blocks [0, N-2] so the first real
+    # allocation starts at block_id = N-1. Default: 0 (disabled).
+    "VLLM_ASCEND_SKIP_LOW_BLOCKS": lambda: int(os.getenv("VLLM_ASCEND_SKIP_LOW_BLOCKS", "0")),
 }
 
 # end-env-vars-definition

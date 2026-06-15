@@ -302,6 +302,35 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         elif self.speculative_config and self.speculative_config.parallel_drafting:
             seq_lens = common_attn_metadata.seq_lens
 
+        # [DFLASH_DIAG] Log attention metadata for DFlash debugging
+        if self.speculative_config and self.speculative_config.parallel_drafting:
+            from vllm.logger import logger as _logger
+            _seq_lens_cpu_val = (common_attn_metadata._seq_lens_cpu[:num_reqs].tolist()
+                                 if common_attn_metadata._seq_lens_cpu is not None else None)
+            _seq_lens_cpu_src = "_seq_lens_cpu"
+            if common_attn_metadata._seq_lens_cpu is None and common_attn_metadata.seq_lens_cpu is not None:
+                _seq_lens_cpu_val = common_attn_metadata.seq_lens_cpu[:num_reqs].tolist()
+                _seq_lens_cpu_src = "seq_lens_cpu"
+            elif common_attn_metadata._seq_lens_cpu is None and common_attn_metadata.seq_lens_cpu is None:
+                _seq_lens_cpu_val = "None_both"
+                _seq_lens_cpu_src = "fallback_to_gpu"
+            _logger.info(
+                "[DFLASH_DIAG] build(): attn_state=%s, causal=%s, "
+                "seq_lens(from parallel_drafting GPU)=%s, "
+                "_seq_lens_cpu(src=%s)=%s, "
+                "actual_seq_lengths_q=%s, seq_lens_list=%s, "
+                "num_reqs=%d, num_actual_tokens=%d",
+                common_attn_metadata.attn_state,
+                common_attn_metadata.causal,
+                seq_lens[:num_reqs].tolist() if hasattr(seq_lens, 'tolist') else seq_lens,
+                _seq_lens_cpu_src,
+                _seq_lens_cpu_val,
+                query_start_loc_cpu[1:].tolist(),
+                seq_lens.tolist() if hasattr(seq_lens, 'tolist') else "N/A",
+                num_reqs,
+                num_actual_tokens,
+            )
+
         attn_state = common_attn_metadata.attn_state
 
         # Get attn_mask from singleton AttentionMaskBuilder

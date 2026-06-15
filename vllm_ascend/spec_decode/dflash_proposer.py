@@ -5,6 +5,8 @@ from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 
+from vllm.logger import logger
+
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, set_ascend_forward_context
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
@@ -144,6 +146,27 @@ class AscendDflashProposer(AscendEagleProposer):
         cad.causal = False
         cad.attn_mask = None
         cad.attn_state = AscendAttentionState.ChunkedPrefill
+
+        # [DFLASH_DIAG] Log key metadata fields for first-request repetition debugging
+        new_seq_lens = effective_seq_lens + num_query_per_req
+        logger.info(
+            "[DFLASH_DIAG] set_inputs_first_pass: batch_size=%d, num_context=%d, "
+            "num_query_total=%d, has_num_rejected=%s, "
+            "cad._seq_lens_cpu=%s, cad.seq_lens_cpu=%s, "
+            "cad.seq_lens(GPU before)=%s, new_seq_lens(GPU after)=%s, "
+            "cad._num_computed_tokens_cpu=%s, cad.num_computed_tokens_cpu=%s, "
+            "cad.attn_state=%s, cad.causal=%s",
+            batch_size, num_context, num_query_total,
+            has_num_rejected,
+            cad._seq_lens_cpu[:batch_size].tolist() if cad._seq_lens_cpu is not None else None,
+            cad.seq_lens_cpu[:batch_size].tolist() if cad.seq_lens_cpu is not None else None,
+            effective_seq_lens[:batch_size].tolist(),
+            new_seq_lens[:batch_size].tolist(),
+            cad._num_computed_tokens_cpu[:batch_size].tolist() if cad._num_computed_tokens_cpu is not None else None,
+            cad.num_computed_tokens_cpu[:batch_size].tolist() if cad.num_computed_tokens_cpu is not None else None,
+            cad.attn_state,
+            cad.causal,
+        )
 
         return num_query_total, token_indices_to_sample, cad, None
 

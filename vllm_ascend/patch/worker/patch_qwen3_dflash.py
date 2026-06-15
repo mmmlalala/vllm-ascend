@@ -4,14 +4,12 @@ from vllm.logger import logger
 from vllm.model_executor.models.qwen3_dflash import DFlashQwen3Model
 
 
-def _safe_tensor_stat(t: torch.Tensor, name: str) -> str:
-    """Compute norm/nan stats on NPU safely; catch device errors."""
-    try:
-        n = t.float().norm().item()
-        has_nan = torch.isnan(t).any().item()
-        return f"{name}_norm={n:.4f}, {name}_has_nan={has_nan}"
-    except Exception as e:
-        return f"{name}_stat_err={e}"
+def _cpu_slice_stat(t: torch.Tensor, name: str, max_slice: int = 64) -> str:
+    """Move a small slice to CPU for stats; avoids NPU operator errors."""
+    s = t.reshape(t.shape[0], -1)[:max_slice].float().cpu()
+    n = s.norm().item()
+    has_nan = torch.isnan(s).any().item()
+    return f"{name}_norm={n:.4f}, {name}_has_nan={has_nan}"
 
 
 def precompute_and_store_context_kv(
@@ -51,11 +49,10 @@ def precompute_and_store_context_kv(
     all_k_flat = all_k_normed.view(L * num_ctx, kv)
     positions_repeated = context_positions.repeat(L)
     tmpv = all_k_flat.clone()
-    # [DFLASH_DIAG] Log K norm before RoPE
-    k_stat_before = _safe_tensor_stat(all_k_flat, "k_before_rope")
+    # [DFLASH_DIAG] Log K norm before/after RoPE (small slice to CPU)
+    k_stat_before = _cpu_slice_stat(all_k_flat, "k_before_rope")
     self.layers[0].self_attn.rotary_emb(positions_repeated, all_k_flat, tmpv)
-    # [DFLASH_DIAG] Log K norm after RoPE to verify it was applied in-place
-    k_stat_after = _safe_tensor_stat(all_k_flat, "k_after_rope")
+    k_stat_after = _cpu_slice_stat(all_k_flat, "k_after_rope")
     logger.info(
         "[DFLASH_DIAG] precompute_kv RoPE: num_ctx=%d, L=%d, %s, %s",
         num_ctx, L, k_stat_before, k_stat_after,
@@ -69,10 +66,10 @@ def precompute_and_store_context_kv(
     for i in range(L):
         attn = self._attn_layers[i]
         kv_cache = attn.kv_cache
-        # [DFLASH_DIAG] Log K/V stats and slot_mapping for first 2 layers
+        # [DFLASH_DIAG] Log K/V stats for first 2 layers
         if i < 2:
-            k_stat = _safe_tensor_stat(all_k_final[i], f"layer{i}_k")
-            v_stat = _safe_tensor_stat(all_v[i], f"layer{i}_v")
+            k_stat = _cpu_slice_stat(all_k_final[i], f"layer{i}_k")
+            v_stat = _cpu_slice_stat(all_v[i], f"layer{i}_v")
             logger.info(
                 "[DFLASH_DIAG] precompute_kv layer %d: %s, %s, "
                 "slot_mapping[:5]=%s, slot_mapping_dtype=%s",
@@ -87,13 +84,6 @@ def precompute_and_store_context_kv(
             kv_cache,
             context_slot_mapping,
         )
-        # [DFLASH_DIAG] Verify key_cache after write for first 2 layers
-        if i < 2 and attn.impl.key_cache is not None:
-            kc_stat = _safe_tensor_stat(attn.impl.key_cache, f"layer{i}_key_cache")
-            logger.info(
-                "[DFLASH_DIAG] precompute_kv layer %d after cache write: %s",
-                i, kc_stat,
-            )
 
 
 DFlashQwen3Model.precompute_and_store_context_kv = precompute_and_store_context_kv

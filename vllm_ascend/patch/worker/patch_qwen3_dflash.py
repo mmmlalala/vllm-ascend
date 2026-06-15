@@ -19,21 +19,18 @@ def precompute_and_store_context_kv(
     hd = self._head_dim
     nkv = self._num_kv_heads
 
-    # [DFLASH_DIAG] Log input stats (context_states is small enough to CPU)
-    try:
-        cs_cpu = context_states[:64].float().cpu()
-        logger.info(
-            "[DFLASH_DIAG] precompute_kv input: num_ctx=%d, L=%d, "
-            "context_states_norm=%.4f, context_states_has_nan=%s, "
-            "context_positions[:5]=%s, slot_mapping_dtype=%s",
-            num_ctx, L,
-            cs_cpu.norm().item(),
-            torch.isnan(cs_cpu).any().item(),
-            context_positions[:5].tolist(),
-            context_slot_mapping.dtype if context_slot_mapping is not None else None,
-        )
-    except Exception as e:
-        logger.info("[DFLASH_DIAG] precompute_kv input stat failed: %s", e)
+    # [DFLASH_DIAG] Log input metadata
+    logger.info(
+        "[DFLASH_DIAG] precompute_kv: num_ctx=%d, L=%d, "
+        "context_states_shape=%s, context_states_dtype=%s, "
+        "context_positions[:5]=%s, "
+        "slot_mapping[:5]=%s, slot_mapping_dtype=%s",
+        num_ctx, L,
+        list(context_states.shape), context_states.dtype,
+        context_positions[:5].tolist(),
+        context_slot_mapping[:5].tolist() if context_slot_mapping is not None else None,
+        context_slot_mapping.dtype if context_slot_mapping is not None else None,
+    )
 
     # --- Fused KV projection (one GEMM for all layers) ---
     normed_context_states = self.hidden_norm(context_states)
@@ -45,35 +42,11 @@ def precompute_and_store_context_kv(
     all_k = all_kv[0]  # [L, num_ctx, nkv, hd], contiguous
     all_v = all_kv[1]  # [L, num_ctx, nkv, hd], contiguous
 
-    # [DFLASH_DIAG] Log KV projection output (small slice to CPU)
-    try:
-        k_cpu = all_k[0, :64].reshape(64, -1).float().cpu()
-        v_cpu = all_v[0, :64].reshape(64, -1).float().cpu()
-        logger.info(
-            "[DFLASH_DIAG] precompute_kv after KV proj layer0: "
-            "k_norm=%.4f, k_has_nan=%s, v_norm=%.4f, v_has_nan=%s",
-            k_cpu.norm().item(), torch.isnan(k_cpu).any().item(),
-            v_cpu.norm().item(), torch.isnan(v_cpu).any().item(),
-        )
-    except Exception as e:
-        logger.info("[DFLASH_DIAG] precompute_kv after KV proj stat failed: %s", e)
-
     # --- Per-layer RMSNorm K (3D: [num_ctx, nkv, hd] per layer) ---
     all_k_normed = torch.empty_like(all_k)
     for i in range(L):
         k_norm_layer = self.layers[i].self_attn.k_norm
         all_k_normed[i] = k_norm_layer(all_k[i])
-
-    # [DFLASH_DIAG] Log k_norm output (small slice to CPU)
-    try:
-        kn_cpu = all_k_normed[0, :64].reshape(64, -1).float().cpu()
-        logger.info(
-            "[DFLASH_DIAG] precompute_kv after k_norm layer0: "
-            "k_normed_norm=%.4f, k_normed_has_nan=%s",
-            kn_cpu.norm().item(), torch.isnan(kn_cpu).any().item(),
-        )
-    except Exception as e:
-        logger.info("[DFLASH_DIAG] precompute_kv after k_norm stat failed: %s", e)
 
     # --- Fused RoPE across all layers ---
     # View as [L * num_ctx, kv] so RoPE sees one big batch (no copy).
@@ -82,16 +55,6 @@ def precompute_and_store_context_kv(
     positions_repeated = context_positions.repeat(L)
     tmpv = all_k_flat.clone()
     self.layers[0].self_attn.rotary_emb(positions_repeated, all_k_flat, tmpv)
-    # [DFLASH_DIAG] Log K after RoPE (small slice to CPU)
-    try:
-        kr_cpu = all_k_flat[:64].reshape(64, -1).float().cpu()
-        logger.info(
-            "[DFLASH_DIAG] precompute_kv after RoPE: "
-            "k_rope_norm=%.4f, k_rope_has_nan=%s",
-            kr_cpu.norm().item(), torch.isnan(kr_cpu).any().item(),
-        )
-    except Exception as e:
-        logger.info("[DFLASH_DIAG] precompute_kv after RoPE stat failed: %s", e)
 
     if context_slot_mapping is None:
         return

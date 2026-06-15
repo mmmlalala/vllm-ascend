@@ -113,6 +113,10 @@ def chunk_gated_delta_rule_fwd(
     w, u = torch.ops.cloud_ops_turbo.cloud_recompute_wu(
         k, v, A, beta_bht, g_bht, chunk_offsets_idx, chunk_size=chunk_size,
     )
+    # cloud_ops_turbo custom AscendC operators may use internal CANN streams
+    # not ordered with the default PyTorch NPU stream. Synchronize to ensure
+    # outputs are ready before downstream ops.
+    torch.npu.synchronize()
     # cloud_recompute_wu returns w: [B, H, T, K], u: [B, H, T, V] (head-first).
     # Transpose to [B, T, H, K/V] (time-first) for downstream Triton kernels.
     w = w.transpose(1, 2).contiguous()
@@ -127,9 +131,9 @@ def chunk_gated_delta_rule_fwd(
     cu_seqlens = None if cu_seqlens is None else cu_seqlens.to(torch.int64)
     chunk_indices = None if chunk_indices_chunk64 is None else chunk_indices_chunk64.to(torch.int64)
     if cu_seqlens_host is None and cu_seqlens is not None:
-        cu_seqlens_host = tuple(cu_seqlens.tolist())
+        cu_seqlens_host = tuple(cu_seqlens.cpu().tolist())
     if chunk_indices_chunk64_host is None and chunk_indices is not None:
-        chunk_indices_chunk64_host = tuple(chunk_indices.flatten().tolist())
+        chunk_indices_chunk64_host = tuple(chunk_indices.cpu().flatten().tolist())
     h, v_new, final_state = torch.ops._C_ascend.chunk_gated_delta_rule_fwd_h(
         k_ascendc,
         w_ascendc,

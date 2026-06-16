@@ -48,6 +48,30 @@ def precompute_and_store_context_kv(
 
     # --- Per-layer cache insert ---
     all_k_final = all_k_flat.view(L, num_ctx, nkv, hd)
+
+    # [DFLASH_DIAG] Check cache state BEFORE write - are target blocks zero?
+    _kv_cache_l0 = self._attn_layers[0].kv_cache
+    if _kv_cache_l0 is not None:
+        _key_cache_l0 = _kv_cache_l0[0]
+        block_size = _key_cache_l0.shape[1]
+        slots = context_slot_mapping[:min(num_ctx, 10)]
+        unique_bids = sorted(set((slots // block_size).tolist()))
+        pre_write_info = []
+        for bid in unique_bids:
+            blk = _key_cache_l0[bid].detach().cpu()
+            nz = (blk != 0).sum().item()
+            total = blk.numel()
+            mx = blk.abs().max().item()
+            pre_write_info.append(
+                "blk%d:nz=%d/%d:max=%.4e" % (bid, nz, total, mx)
+            )
+        logger.info(
+            "[DFLASH_DIAG] precompute_kv BEFORE write: num_ctx=%d, "
+            "slot_mapping[:5]=%s, unique_blocks=%s, cache_state=[%s]",
+            num_ctx, context_slot_mapping[:5].tolist(),
+            unique_bids, ", ".join(pre_write_info),
+        )
+
     for i in range(L):
         attn = self._attn_layers[i]
         kv_cache = attn.kv_cache
@@ -59,34 +83,21 @@ def precompute_and_store_context_kv(
             context_slot_mapping,
         )
 
-    # [DFLASH_DIAG] Verify KV cache write: read back key_cache at the
-    # written slots and compare with the K we just wrote.
-    # Only check layer 0 to keep overhead low.
-    key_cache = self._attn_layers[0].impl.key_cache
-    if key_cache is not None:
-        block_size = key_cache.shape[1]
+    # [DFLASH_DIAG] Verify write correctness - read back and compare (layer 0 only)
+    _key_cache_l0 = self._attn_layers[0].impl.key_cache
+    if _key_cache_l0 is not None:
+        block_size = _key_cache_l0.shape[1]
         slots = context_slot_mapping[:min(num_ctx, 5)]
-        block_ids = slots // block_size
-        block_offsets = slots % block_size
-        # Read back the first few slots from key_cache
         readback_vals = []
         for s_idx in range(slots.shape[0]):
-            bid = block_ids[s_idx].item()
-            boff = block_offsets[s_idx].item()
-            # key_cache shape: [num_blocks, block_size, nkv, hd]
-            readback_k = key_cache[bid, boff, :, :].detach().cpu()
-            expected_k = all_k_final[0, s_idx, :, :].detach().cpu()
-            diff_norm = (readback_k - expected_k).norm().item()
-            readback_vals.append(
-                "slot=%d:block=%d:off=%d:diff_norm=%.6f"
-                % (slots[s_idx].item(), bid, boff, diff_norm)
-            )
+            bid = (slots[s_idx] // block_size).item()
+            boff = (slots[s_idx] % block_size).item()
+            readback_k = _key_cache_l0[bid, boff].detach().cpu()
+            expected_k = all_k_final[0, s_idx].detach().cpu()
+            diff = (readback_k - expected_k).norm().item()
+            readback_vals.append("s%d:blk%d:diff=%.6f" % (slots[s_idx].item(), bid, diff))
         logger.info(
-            "[DFLASH_DIAG] precompute_kv cache_verify: num_ctx=%d, L=%d, "
-            "slot_mapping[:5]=%s, slot_dtype=%s, cache_readback=[%s]",
-            num_ctx, L,
-            context_slot_mapping[:5].tolist(),
-            context_slot_mapping.dtype,
+            "[DFLASH_DIAG] precompute_kv AFTER write: cache_verify=[%s]",
             ", ".join(readback_vals),
         )
 

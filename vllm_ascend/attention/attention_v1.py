@@ -1110,26 +1110,43 @@ class AscendAttentionBackendImpl(AttentionImpl):
             )
         else:
             if not attn_metadata.causal:
-                # [DFLASH_DIAG] Log FIA inputs for non-causal (DFlash) path
                 from vllm.logger import logger as _fia_logger
                 _layer_idx = getattr(self, 'layerIndex', -1)
-                _bt_sample = block_table[0, :5].tolist() if block_table is not None else None
-                _fia_logger.info(
-                    "[DFLASH_DIAG] FIA non-causal: layer_idx=%s, "
-                    "query_shape=%s, key_shape=%s, value_shape=%s, "
-                    "block_table_shape=%s, block_table[0,:5]=%s, block_size=%d, "
-                    "actual_seq_lengths_q=%s, actual_seq_lengths_kv=%s, "
-                    "num_kv_heads=%d, num_heads=%d, scale=%.6f, "
-                    "query_norm=%.4f, key_norm=%.4f, value_norm=%.4f",
-                    _layer_idx,
-                    list(query.shape), list(key.shape), list(value.shape),
-                    list(block_table.shape) if block_table is not None else None,
-                    _bt_sample, block_size,
-                    attn_metadata.actual_seq_lengths_q,
-                    actual_seq_lengths_kv,
-                    self.num_kv_heads, self.num_heads, self.scale,
-                    query.norm().item(), key.norm().item(), value.norm().item(),
-                )
+                # [DFLASH_DIAG] Log FIA inputs and cache state (layer 0 only)
+                if _layer_idx == 0:
+                    _bt_sample = block_table[0, :5].tolist() if block_table is not None else None
+                    _fia_logger.info(
+                        "[DFLASH_DIAG] FIA input: layer=%s, q_shape=%s, k_shape=%s, "
+                        "block_table[0,:5]=%s, block_size=%d, "
+                        "seq_q=%s, seq_kv=%s, sparse_mode=0, "
+                        "q_norm=%.4f, k_norm=%.4f",
+                        _layer_idx,
+                        list(query.shape), list(key.shape),
+                        _bt_sample, block_size,
+                        attn_metadata.actual_seq_lengths_q,
+                        actual_seq_lengths_kv,
+                        query.norm().item(), key.norm().item(),
+                    )
+                    if block_table is not None and self.key_cache is not None:
+                        bt_first = block_table[0]
+                        n_bt = min(bt_first.shape[0], 10)
+                        bt_ids = bt_first[:n_bt].tolist()
+                        cache_check = []
+                        for bid in bt_ids:
+                            if 0 <= bid < self.key_cache.shape[0]:
+                                blk_k = self.key_cache[bid].detach().cpu()
+                                nz = (blk_k != 0).sum().item()
+                                total = blk_k.numel()
+                                mx = blk_k.abs().max().item()
+                                cache_check.append(
+                                    "blk%d:nz=%d/%d:max=%.4e"
+                                    % (bid, nz, total, mx)
+                                )
+                        _fia_logger.info(
+                            "[DFLASH_DIAG] FIA cache BEFORE read: "
+                            "block_table[0][:10]=%s, key_cache_state=[%s]",
+                            bt_ids, ", ".join(cache_check),
+                        )
                 attn_output, _ = torch_npu.npu_fused_infer_attention_score(
                     query=query,
                     key=key,
@@ -1144,12 +1161,10 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     scale=self.scale,
                     sparse_mode=0,
                 )
-                # [DFLASH_DIAG] Log FIA output
+                # [DFLASH_DIAG] Log FIA output (all layers, concise)
                 _fia_logger.info(
-                    "[DFLASH_DIAG] FIA non-causal output: layer_idx=%s, "
-                    "output_shape=%s, output_norm=%.4f, output_has_nan=%s",
+                    "[DFLASH_DIAG] FIA output: layer=%s, norm=%.4f, nan=%s",
                     _layer_idx,
-                    list(attn_output.shape),
                     attn_output.norm().item(),
                     torch.isnan(attn_output).any().item(),
                 )
@@ -1271,24 +1286,34 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
             slots = attn_metadata.slot_mapping
             encoder_decoder = self.attn_type == AttentionType.ENCODER_DECODER
-            # [DFLASH_DIAG] Log reshape_and_cache for non-causal (DFlash) path
-            if not attn_metadata.causal:
+            # [DFLASH_DIAG] Check cache state before query token write
+            if not attn_metadata.causal and not encoder_decoder:
                 from vllm.logger import logger as _rc_logger
                 _layer_idx = getattr(self, 'layerIndex', -1)
-                used_slots = slots[: attn_metadata.num_actual_tokens] if not encoder_decoder else slots
-                _rc_logger.info(
-                    "[DFLASH_DIAG] reshape_and_cache: layer_idx=%s, causal=False, "
-                    "key_shape=%s, value_shape=%s, "
-                    "slot_mapping[:5]=%s, slot_mapping_dtype=%s, "
-                    "num_actual_tokens=%d, key_norm=%.4f, value_norm=%.4f",
-                    _layer_idx,
-                    list(key.shape), list(value.shape),
-                    used_slots[:5].tolist() if not encoder_decoder else "enc_dec",
-                    used_slots.dtype,
-                    attn_metadata.num_actual_tokens,
-                    key[:attn_metadata.num_actual_tokens].norm().item() if not encoder_decoder else key.norm().item(),
-                    value[:attn_metadata.num_actual_tokens].norm().item() if not encoder_decoder else value.norm().item(),
-                )
+                used_slots = slots[:attn_metadata.num_actual_tokens]
+                if self.key_cache is not None and _layer_idx == 0:
+                    block_size = self.key_cache.shape[1]
+                    sample_slots = used_slots[:min(5, used_slots.shape[0])]
+                    slot_info = []
+                    for s in sample_slots:
+                        bid = (s // block_size).item()
+                        boff = (s % block_size).item()
+                        slot_k = self.key_cache[bid, boff].detach().cpu()
+                        nz = (slot_k != 0).sum().item()
+                        mx = slot_k.abs().max().item()
+                        slot_info.append(
+                            "s%d:blk%d:off%d:nz=%d:max=%.4e"
+                            % (s.item(), bid, boff, nz, mx)
+                        )
+                    _rc_logger.info(
+                        "[DFLASH_DIAG] reshape_and_cache BEFORE write: layer=%s, "
+                        "slots[:5]=%s, num_actual_tokens=%d, "
+                        "cache_before=[%s]",
+                        _layer_idx,
+                        used_slots[:5].tolist(),
+                        attn_metadata.num_actual_tokens,
+                        ", ".join(slot_info),
+                    )
             DeviceOperator.reshape_and_cache(
                 key=key[: attn_metadata.num_actual_tokens] if not encoder_decoder else key,
                 value=value[: attn_metadata.num_actual_tokens] if not encoder_decoder else value,

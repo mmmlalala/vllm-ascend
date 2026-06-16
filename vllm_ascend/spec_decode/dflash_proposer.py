@@ -147,18 +147,6 @@ class AscendDflashProposer(AscendEagleProposer):
         cad.attn_mask = None
         cad.attn_state = AscendAttentionState.ChunkedPrefill
 
-        # [DFLASH_DIAG]
-        logger.info(
-            "[DFLASH_DIAG] set_inputs_first_pass: batch_size=%d, num_context=%d, "
-            "num_query_total=%d, has_num_rejected=%s, "
-            "seq_lens(GPU after)=%s, causal=%s, attn_state=%s",
-            batch_size, num_context, num_query_total,
-            has_num_rejected,
-            (effective_seq_lens + num_query_per_req)[:batch_size].tolist(),
-            cad.causal,
-            cad.attn_state,
-        )
-
         return num_query_total, token_indices_to_sample, cad, None
 
     @torch.inference_mode()

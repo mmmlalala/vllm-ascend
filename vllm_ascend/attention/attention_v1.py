@@ -1110,43 +1110,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
             )
         else:
             if not attn_metadata.causal:
-                from vllm.logger import logger as _fia_logger
-                _layer_idx = getattr(self, 'layerIndex', -1)
-                # [DFLASH_DIAG] Log FIA inputs and cache state (layer 0 only)
-                if _layer_idx == 0:
-                    _bt_sample = block_table[0, :5].tolist() if block_table is not None else None
-                    _fia_logger.info(
-                        "[DFLASH_DIAG] FIA input: layer=%s, q_shape=%s, k_shape=%s, "
-                        "block_table[0,:5]=%s, block_size=%d, "
-                        "seq_q=%s, seq_kv=%s, sparse_mode=0, "
-                        "q_norm=%.4f, k_norm=%.4f",
-                        _layer_idx,
-                        list(query.shape), list(key.shape),
-                        _bt_sample, block_size,
-                        attn_metadata.actual_seq_lengths_q,
-                        actual_seq_lengths_kv,
-                        query.norm().item(), key.norm().item(),
-                    )
-                    if block_table is not None and self.key_cache is not None:
-                        bt_first = block_table[0]
-                        n_bt = min(bt_first.shape[0], 10)
-                        bt_ids = bt_first[:n_bt].tolist()
-                        cache_check = []
-                        for bid in bt_ids:
-                            if 0 <= bid < self.key_cache.shape[0]:
-                                blk_k = self.key_cache[bid].detach().cpu()
-                                nz = (blk_k != 0).sum().item()
-                                total = blk_k.numel()
-                                mx = blk_k.abs().max().item()
-                                cache_check.append(
-                                    "blk%d:nz=%d/%d:max=%.4e"
-                                    % (bid, nz, total, mx)
-                                )
-                        _fia_logger.info(
-                            "[DFLASH_DIAG] FIA cache BEFORE read: "
-                            "block_table[0][:10]=%s, key_cache_state=[%s]",
-                            bt_ids, ", ".join(cache_check),
-                        )
                 attn_output, _ = torch_npu.npu_fused_infer_attention_score(
                     query=query,
                     key=key,
@@ -1160,13 +1123,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     num_heads=self.num_heads,
                     scale=self.scale,
                     sparse_mode=0,
-                )
-                # [DFLASH_DIAG] Log FIA output (all layers, concise)
-                _fia_logger.info(
-                    "[DFLASH_DIAG] FIA output: layer=%s, norm=%.4f, nan=%s",
-                    _layer_idx,
-                    attn_output.norm().item(),
-                    torch.isnan(attn_output).any().item(),
                 )
             elif self.sliding_window is not None:
                 attn_output, _ = torch_npu.npu_fused_infer_attention_score(
@@ -1187,6 +1143,42 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     sparse_mode=4,
                 )
             else:
+                # [KV_DIAG] Causal FIA (target model) - check cache state before read
+                from vllm.logger import logger as _fia_logger
+                _layer_idx = getattr(self, 'layerIndex', -1)
+                if _layer_idx == 0 and block_table is not None and self.key_cache is not None:
+                    _n_reqs = block_table.shape[0]
+                    _bt_first = block_table[0, :5].tolist()
+                    _fia_logger.info(
+                        "[KV_DIAG] FIA causal: layer=%s, q_shape=%s, "
+                        "num_reqs=%d, block_table[0,:5]=%s, block_size=%d, "
+                        "seq_q=%s, seq_kv=%s, sparse_mode=3",
+                        _layer_idx, list(query.shape),
+                        _n_reqs, _bt_first, block_size,
+                        attn_metadata.actual_seq_lengths_q,
+                        actual_seq_lengths_kv,
+                    )
+                    # Check key_cache state for first 2 requests' block tables
+                    for _ri in range(min(_n_reqs, 2)):
+                        _bt_row = block_table[_ri]
+                        _n_bt = min(_bt_row.shape[0], 10)
+                        _bt_ids = _bt_row[:_n_bt].tolist()
+                        _cache_check = []
+                        for bid in _bt_ids:
+                            if 0 <= bid < self.key_cache.shape[0]:
+                                blk_k = self.key_cache[bid].detach().cpu()
+                                nz = (blk_k != 0).sum().item()
+                                total = blk_k.numel()
+                                mx = blk_k.abs().max().item()
+                                _cache_check.append(
+                                    "blk%d:nz=%d/%d:max=%.4e"
+                                    % (bid, nz, total, mx)
+                                )
+                        _fia_logger.info(
+                            "[KV_DIAG] FIA causal cache req[%d]: "
+                            "block_table[:10]=%s, key_cache_state=[%s]",
+                            _ri, _bt_ids, ", ".join(_cache_check),
+                        )
                 attn_output, _ = torch_npu.npu_fused_infer_attention_score(
                     query=query,
                     key=key,
@@ -1202,6 +1194,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     scale=self.scale,
                     sparse_mode=3,
                 )
+                # [KV_DIAG] FIA causal output (layer 0 only)
+                if _layer_idx == 0:
+                    _fia_logger.info(
+                        "[KV_DIAG] FIA causal output: layer=%s, norm=%.4f, nan=%s",
+                        _layer_idx,
+                        attn_output.norm().item(),
+                        torch.isnan(attn_output).any().item(),
+                    )
 
             attn_output = attn_output.view(num_tokens, self.num_heads, self.head_size)
         output[:num_tokens] = attn_output[:num_tokens]
@@ -1286,14 +1286,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
             slots = attn_metadata.slot_mapping
             encoder_decoder = self.attn_type == AttentionType.ENCODER_DECODER
-            # [DFLASH_DIAG] Check cache state before query token write
-            if not attn_metadata.causal and not encoder_decoder:
+            # [KV_DIAG] Check cache state before causal write (target model, layer 0)
+            if attn_metadata.causal and not encoder_decoder:
                 from vllm.logger import logger as _rc_logger
                 _layer_idx = getattr(self, 'layerIndex', -1)
-                used_slots = slots[:attn_metadata.num_actual_tokens]
                 if self.key_cache is not None and _layer_idx == 0:
                     block_size = self.key_cache.shape[1]
-                    sample_slots = used_slots[:min(5, used_slots.shape[0])]
+                    used_slots = slots[:attn_metadata.num_actual_tokens]
+                    sample_slots = used_slots[:min(10, used_slots.shape[0])]
                     slot_info = []
                     for s in sample_slots:
                         bid = (s // block_size).item()
@@ -1306,12 +1306,12 @@ class AscendAttentionBackendImpl(AttentionImpl):
                             % (s.item(), bid, boff, nz, mx)
                         )
                     _rc_logger.info(
-                        "[DFLASH_DIAG] reshape_and_cache BEFORE write: layer=%s, "
-                        "slots[:5]=%s, num_actual_tokens=%d, "
+                        "[KV_DIAG] reshape_and_cache BEFORE write: layer=%s, "
+                        "num_actual_tokens=%d, slots[:10]=%s, "
                         "cache_before=[%s]",
                         _layer_idx,
-                        used_slots[:5].tolist(),
                         attn_metadata.num_actual_tokens,
+                        used_slots[:10].tolist(),
                         ", ".join(slot_info),
                     )
             DeviceOperator.reshape_and_cache(

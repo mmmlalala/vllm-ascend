@@ -1143,42 +1143,36 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     sparse_mode=4,
                 )
             else:
-                # [KV_DIAG] Causal FIA (target model) - check cache state before read
+                # [KV_DIAG] Check block 0 (null_block) and padding rows in block_table
                 from vllm.logger import logger as _fia_logger
                 _layer_idx = getattr(self, 'layerIndex', -1)
                 if _layer_idx == 0 and block_table is not None and self.key_cache is not None:
                     _n_reqs = block_table.shape[0]
-                    _bt_first = block_table[0, :5].tolist()
+                    _n_padded = block_table.shape[0]
+                    # Check block 0 (null_block) state
+                    blk0 = self.key_cache[0].detach().cpu()
+                    _blk0_nz = (blk0 != 0).sum().item()
+                    _blk0_total = blk0.numel()
+                    _blk0_max = blk0.abs().max().item()
+                    # Check padding rows: find rows with block_id=0 in first column
+                    _pad_info = []
+                    for _ri in range(_n_padded):
+                        _first_bid = block_table[_ri, 0].item()
+                        if _first_bid == 0 and _ri > 0:
+                            _pad_info.append("row%d:bid0" % _ri)
                     _fia_logger.info(
-                        "[KV_DIAG] FIA causal: layer=%s, q_shape=%s, "
-                        "num_reqs=%d, block_table[0,:5]=%s, block_size=%d, "
-                        "seq_q=%s, seq_kv=%s, sparse_mode=3",
-                        _layer_idx, list(query.shape),
-                        _n_reqs, _bt_first, block_size,
+                        "[KV_DIAG] FIA causal: layer=%s, num_reqs_padded=%d, "
+                        "block_table[0,:5]=%s, block_table_shape=%s, "
+                        "seq_q=%s, seq_kv=%s, "
+                        "blk0(null):nz=%d/%d:max=%.4e, padding_rows_with_bid0=[%s]",
+                        _layer_idx, _n_padded,
+                        block_table[0, :5].tolist(),
+                        list(block_table.shape),
                         attn_metadata.actual_seq_lengths_q,
                         actual_seq_lengths_kv,
+                        _blk0_nz, _blk0_total, _blk0_max,
+                        ", ".join(_pad_info) if _pad_info else "none",
                     )
-                    # Check key_cache state for first 2 requests' block tables
-                    for _ri in range(min(_n_reqs, 2)):
-                        _bt_row = block_table[_ri]
-                        _n_bt = min(_bt_row.shape[0], 10)
-                        _bt_ids = _bt_row[:_n_bt].tolist()
-                        _cache_check = []
-                        for bid in _bt_ids:
-                            if 0 <= bid < self.key_cache.shape[0]:
-                                blk_k = self.key_cache[bid].detach().cpu()
-                                nz = (blk_k != 0).sum().item()
-                                total = blk_k.numel()
-                                mx = blk_k.abs().max().item()
-                                _cache_check.append(
-                                    "blk%d:nz=%d/%d:max=%.4e"
-                                    % (bid, nz, total, mx)
-                                )
-                        _fia_logger.info(
-                            "[KV_DIAG] FIA causal cache req[%d]: "
-                            "block_table[:10]=%s, key_cache_state=[%s]",
-                            _ri, _bt_ids, ", ".join(_cache_check),
-                        )
                 attn_output, _ = torch_npu.npu_fused_infer_attention_score(
                     query=query,
                     key=key,
@@ -1194,14 +1188,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     scale=self.scale,
                     sparse_mode=3,
                 )
-                # [KV_DIAG] FIA causal output (layer 0 only)
-                if _layer_idx == 0:
-                    _fia_logger.info(
-                        "[KV_DIAG] FIA causal output: layer=%s, norm=%.4f, nan=%s",
-                        _layer_idx,
-                        attn_output.norm().item(),
-                        torch.isnan(attn_output).any().item(),
-                    )
 
             attn_output = attn_output.view(num_tokens, self.num_heads, self.head_size)
         output[:num_tokens] = attn_output[:num_tokens]
@@ -1215,6 +1201,35 @@ class AscendAttentionBackendImpl(AttentionImpl):
     ) -> torch.Tensor:
         if _EXTRA_CTX.capturing:
             return self.full_graph_pa(query, attn_metadata, output)
+        # [KV_DIAG] Check block 0 and block_table padding before paged_attention
+        _layer_idx = getattr(self, 'layerIndex', -1)
+        if _layer_idx == 0 and self.key_cache is not None:
+            from vllm.logger import logger as _pa_logger
+            _bt = attn_metadata.block_tables
+            _n_reqs = _bt.shape[0] if _bt is not None else 0
+            # Check block 0 (null_block) state
+            blk0 = self.key_cache[0].detach().cpu()
+            _blk0_nz = (blk0 != 0).sum().item()
+            _blk0_total = blk0.numel()
+            _blk0_max = blk0.abs().max().item()
+            # Check first request's block table
+            _bt_first5 = _bt[0, :5].tolist() if _bt is not None else []
+            # Check padding rows with block_id=0
+            _pad_rows = []
+            if _bt is not None:
+                for _ri in range(_n_reqs):
+                    if _bt[_ri, 0].item() == 0 and _ri > 0:
+                        _pad_rows.append("row%d" % _ri)
+            _pa_logger.info(
+                "[KV_DIAG] paged_attention: layer=%s, num_reqs=%d, "
+                "block_table[0,:5]=%s, context_lens[:3]=%s, "
+                "blk0(null):nz=%d/%d:max=%.4e, padding_bid0=[%s]",
+                _layer_idx, _n_reqs,
+                _bt_first5,
+                attn_metadata.seq_lens[:min(3, _n_reqs)].tolist() if _bt is not None else [],
+                _blk0_nz, _blk0_total, _blk0_max,
+                ", ".join(_pad_rows) if _pad_rows else "none",
+            )
         torch_npu._npu_paged_attention(
             query=query,
             key_cache=self.key_cache,
@@ -1286,34 +1301,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
             slots = attn_metadata.slot_mapping
             encoder_decoder = self.attn_type == AttentionType.ENCODER_DECODER
-            # [KV_DIAG] Check cache state before causal write (target model, layer 0)
-            if attn_metadata.causal and not encoder_decoder:
-                from vllm.logger import logger as _rc_logger
-                _layer_idx = getattr(self, 'layerIndex', -1)
-                if self.key_cache is not None and _layer_idx == 0:
-                    block_size = self.key_cache.shape[1]
-                    used_slots = slots[:attn_metadata.num_actual_tokens]
-                    sample_slots = used_slots[:min(10, used_slots.shape[0])]
-                    slot_info = []
-                    for s in sample_slots:
-                        bid = (s // block_size).item()
-                        boff = (s % block_size).item()
-                        slot_k = self.key_cache[bid, boff].detach().cpu()
-                        nz = (slot_k != 0).sum().item()
-                        mx = slot_k.abs().max().item()
-                        slot_info.append(
-                            "s%d:blk%d:off%d:nz=%d:max=%.4e"
-                            % (s.item(), bid, boff, nz, mx)
-                        )
-                    _rc_logger.info(
-                        "[KV_DIAG] reshape_and_cache BEFORE write: layer=%s, "
-                        "num_actual_tokens=%d, slots[:10]=%s, "
-                        "cache_before=[%s]",
-                        _layer_idx,
-                        attn_metadata.num_actual_tokens,
-                        used_slots[:10].tolist(),
-                        ", ".join(slot_info),
-                    )
             DeviceOperator.reshape_and_cache(
                 key=key[: attn_metadata.num_actual_tokens] if not encoder_decoder else key,
                 value=value[: attn_metadata.num_actual_tokens] if not encoder_decoder else value,

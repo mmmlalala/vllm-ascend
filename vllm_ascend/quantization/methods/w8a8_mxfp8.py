@@ -32,6 +32,7 @@ from vllm_ascend.device.mxfp_compat import (
     ensure_mxfp8_linear_available,
     ensure_mxfp8_moe_available,
 )
+import vllm_ascend.envs as envs_ascend
 from vllm_ascend.flash_common3_context import get_flash_common3_context
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
@@ -74,11 +75,24 @@ class AscendW8A8MXFP8DynamicLinearMethod(AscendLinearScheme):
         bias: torch.Tensor | None = None,
         tp_rank: int | None = 0,
     ) -> torch.Tensor:
-        # reshape x for Qwen VL models
         original_shape = x.shape
         if x.dim() > 2:
             x = x.view(-1, x.shape[-1])
-        quantized_x, dynamic_scale = torch_npu.npu_dynamic_mx_quant(x, dst_type=torch.float8_e4m3fn)
+
+        is_down_proj_with_swiglu = (
+            "down_proj" in getattr(layer, "prefix", "")
+            and envs_ascend.VLLM_ASCEND_ENABLE_SWIGLU_MX_QUANT_OPS
+        )
+
+        if is_down_proj_with_swiglu:
+            quantized_x, dynamic_scale = torch_npu.npu_swiglu_mx_quant(
+                x, dst_type=torch.float8_e4m3fn
+            )
+        else:
+            quantized_x, dynamic_scale = torch_npu.npu_dynamic_mx_quant(
+                x, dst_type=torch.float8_e4m3fn
+            )
+
         pertoken_scale = dynamic_scale
         output_dtype = x.dtype
         if bias is not None and bias.dtype != torch.float32:
@@ -95,7 +109,6 @@ class AscendW8A8MXFP8DynamicLinearMethod(AscendLinearScheme):
             output_dtype=output_dtype,
             group_sizes=[1, 1, self.group_size],
         )
-        # reshape output for Qwen VL models
         if len(original_shape) > 2:
             output = output.view(*original_shape[:-1], -1)
 

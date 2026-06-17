@@ -90,6 +90,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     # 1: only quant case enable nz;
     # 2: enable nz as long as possible.
     "VLLM_ASCEND_ENABLE_NZ": lambda: int(os.getenv("VLLM_ASCEND_ENABLE_NZ", 1)),
+    # Whether to enable swiglu mx quant ops for down_proj in W8A8 MXFP8 models.
+    # When enabled, down_proj fuses swiglu activation with quantization using
+    # npu_swiglu_mx_quant instead of separate act_fn + npu_dynamic_mx_quant.
+    "VLLM_ASCEND_ENABLE_SWIGLU_MX_QUANT_OPS": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_SWIGLU_MX_QUANT_OPS", "0"))),
     # Whether to anbale dynamic EPLB
     "DYNAMIC_EPLB": lambda: os.getenv("DYNAMIC_EPLB", "false").lower(),
     # Whether to enable fused MC2 (`dispatch_gmm_combine_decode` / `dispatch_ffn_combine`).

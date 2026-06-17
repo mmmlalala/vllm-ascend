@@ -30,6 +30,7 @@ from vllm.model_executor.layers.fused_moe.layer import FusedMoE, UnquantizedFuse
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import RoutedExpertsCapturer
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner  # type: ignore
 
+import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.distributed.parallel_state import get_mc2_group
@@ -514,8 +515,15 @@ class AscendFusedMoE(FusedMoE):
         return shared_gate_up
 
     def _shared_experts_part2(self, hidden_states: torch.Tensor, shared_gate_up: torch.Tensor):
-        shared_act = self._shared_experts.act_fn(shared_gate_up)  # type: ignore
-        shared_out, _ = self._shared_experts.down_proj(shared_act)  # type: ignore
+        down_proj_is_mxfp8 = (
+            envs_ascend.VLLM_ASCEND_ENABLE_SWIGLU_MX_QUANT_OPS
+            and hasattr(self._shared_experts.down_proj, "weight_scale")
+        )
+        if down_proj_is_mxfp8:
+            shared_out, _ = self._shared_experts.down_proj(shared_gate_up)  # type: ignore
+        else:
+            shared_act = self._shared_experts.act_fn(shared_gate_up)  # type: ignore
+            shared_out, _ = self._shared_experts.down_proj(shared_act)  # type: ignore
 
         # Qwen3-Next specific gating mechanism
         assert self._shared_experts is not None

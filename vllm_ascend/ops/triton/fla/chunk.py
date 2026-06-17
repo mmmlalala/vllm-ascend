@@ -38,10 +38,9 @@ def _build_chunk_offsets_idx_from_cu_seqlens(
     # Compute total number of chunks to determine output size
     seq_lens = cu_seqlens_cpu[1:] - cu_seqlens_cpu[:-1]
     chunk_counts = (seq_lens + chunk_size - 1) // chunk_size
-    num_chunks = int(chunk_counts.sum().item())
+    num_chunks = int(chunk_counts.sum())
 
-    out = torch.empty(num_chunks + 1, dtype=torch.int32, device=cu_seqlens.device)
-    # Fill on CPU then copy to device (same pattern as _fill_chunk_offsets_idx_device)
+    # Build entirely on CPU, then copy to device in one shot.
     out_cpu = torch.empty(num_chunks + 1, dtype=torch.int32)
     seq_idx = 0
     last_seqlens = 0
@@ -59,7 +58,7 @@ def _build_chunk_offsets_idx_from_cu_seqlens(
         seq_idx = seqlens
         out_cpu[idx] = seq_idx
         idx += 1
-    out[:idx].copy_(out_cpu[:idx])
+    out = out_cpu[:idx].to(device=cu_seqlens.device)
     return out
 
 
@@ -108,11 +107,6 @@ def chunk_gated_delta_rule_fwd(
         import cloud_ops_turbo  # Lazy import to avoid loading SO at module import time
         beta_bht = beta.transpose(1, 2).contiguous()
         g_bht = g.transpose(1, 2).contiguous()
-
-        def _tensor_info(t):
-            if t is None:
-                return "None"
-            return f"shape={tuple(t.shape)}, dtype={t.dtype}, device={t.device}"
 
         A = torch.ops.cloud_ops_turbo.cloud_chunk_scaled_dot_kkt(
             k, beta_bht, g_bht, chunk_offsets_idx, chunk_size=chunk_size,

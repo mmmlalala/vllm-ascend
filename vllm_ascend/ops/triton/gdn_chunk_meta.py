@@ -151,26 +151,30 @@ def _build_chunk_offsets(
 
 
 def _fill_chunk_offsets_idx_device(out: torch.Tensor, cu_seqlens: torch.Tensor, chunk_size: int) -> int:
-    if out is not None:
-        cu_seqlens_cpu = cu_seqlens.cpu() if cu_seqlens.device.type != "cpu" else cu_seqlens
-        seq_idx = 0
-        last_seqlens = 0
-        out[0] = 0
-        idx = 1
-        for _, seqlens in enumerate(cu_seqlens_cpu.tolist()):
-            if seqlens == last_seqlens:
-                continue
-            else:
-                last_seqlens = seqlens
-            while seq_idx + chunk_size < seqlens:
-                seq_idx += chunk_size
-                out[idx] = seq_idx
-                idx += 1
-            seq_idx = seqlens
-            out[idx] = seq_idx
+    if out is None:
+        return 0
+    cu_seqlens_cpu = cu_seqlens.cpu() if cu_seqlens.device.type != "cpu" else cu_seqlens
+    # Build on CPU first, then copy to device in one shot to avoid
+    # per-element NPU kernel launches.
+    out_cpu = torch.empty(out.shape[0], dtype=torch.int32)
+    seq_idx = 0
+    last_seqlens = 0
+    out_cpu[0] = 0
+    idx = 1
+    for _, seqlens in enumerate(cu_seqlens_cpu.tolist()):
+        if seqlens == last_seqlens:
+            continue
+        else:
+            last_seqlens = seqlens
+        while seq_idx + chunk_size < seqlens:
+            seq_idx += chunk_size
+            out_cpu[idx] = seq_idx
             idx += 1
-        return idx
-    return 0
+        seq_idx = seqlens
+        out_cpu[idx] = seq_idx
+        idx += 1
+    out[:idx].copy_(out_cpu[:idx])
+    return idx
 
 
 def _build_final_chunk_indices(

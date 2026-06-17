@@ -119,9 +119,9 @@ def chunk_gated_delta_rule_fwd(
         )
 
         # cloud_recompute_wu returns w: [B, H, T, K], u: [B, H, T, V] (head-first).
-        # Transpose to [B, T, H, K/V] (time-first) for downstream Triton kernels.
-        w = w.transpose(1, 2).contiguous()
-        u = u.transpose(1, 2).contiguous()
+        # Keep head-first format for downstream AscendC operators which also
+        # expect [B, H, T, K/V].  Only transpose to time-first when the Triton
+        # hupdate kernel (PCP path) needs it.
     else:
         from .chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
         from .solve_tril import solve_tril
@@ -152,11 +152,22 @@ def chunk_gated_delta_rule_fwd(
             chunk_indices=chunk_indices_chunk64,
         )
 
-    k_ascendc = k.to(torch.bfloat16).transpose(1, 2).contiguous()
-    w_ascendc = w.to(torch.bfloat16).transpose(1, 2).contiguous()
-    u_ascendc = u.to(torch.bfloat16).transpose(1, 2).contiguous()
-    g_ascendc = g.transpose(1, 2).contiguous()
-    q_ascendc = q.to(torch.bfloat16).transpose(1, 2).contiguous()
+    if use_cloud_ops:
+        # cloud_ops path: w/u are already head-first [B, H, T, K/V].
+        # AscendC operators expect head-first, so skip the transpose.
+        k_ascendc = k.to(torch.bfloat16).transpose(1, 2).contiguous()
+        w_ascendc = w.to(torch.bfloat16)  # already [B, H, T, K]
+        u_ascendc = u.to(torch.bfloat16)  # already [B, H, T, V]
+        g_ascendc = g.transpose(1, 2).contiguous()
+        q_ascendc = q.to(torch.bfloat16).transpose(1, 2).contiguous()
+    else:
+        # Triton path: w/u are time-first [B, T, H, K/V].
+        # AscendC operators expect head-first, so transpose.
+        k_ascendc = k.to(torch.bfloat16).transpose(1, 2).contiguous()
+        w_ascendc = w.to(torch.bfloat16).transpose(1, 2).contiguous()
+        u_ascendc = u.to(torch.bfloat16).transpose(1, 2).contiguous()
+        g_ascendc = g.transpose(1, 2).contiguous()
+        q_ascendc = q.to(torch.bfloat16).transpose(1, 2).contiguous()
 
     cu_seqlens = None if cu_seqlens is None else cu_seqlens.to(torch.int64)
     chunk_indices = None if chunk_indices_chunk64 is None else chunk_indices_chunk64.to(torch.int64)
@@ -181,10 +192,14 @@ def chunk_gated_delta_rule_fwd(
     )
 
     if get_pcp_group().world_size > 1:
+        # chunk_gated_delta_rule_fwd_hupdate expects time-first [B, T, H, K/V].
+        # In cloud_ops path w/u are head-first, so transpose for hupdate.
+        w_tf = w.transpose(1, 2).contiguous() if use_cloud_ops else w
+        u_tf = u.transpose(1, 2).contiguous() if use_cloud_ops else u
         h_update = chunk_gated_delta_rule_fwd_hupdate(
             k=k,
-            w=w,
-            u=u,
+            w=w_tf,
+            u=u_tf,
             g=g,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices_chunk64,
@@ -220,8 +235,8 @@ def chunk_gated_delta_rule_fwd(
             rerun_initial_state[prefill_slice] = updated_h_state[prefill_slice]
             h, v_new, _ = chunk_gated_delta_rule_fwd_h(
                 k=k,
-                w=w,
-                u=u,
+                w=w_tf,
+                u=u_tf,
                 g=g,
                 initial_state=rerun_initial_state,
                 output_final_state=True,

@@ -82,10 +82,6 @@ class AscendW8A8MXFP8DynamicLinearMethod(AscendLinearScheme):
         is_down_proj_with_swiglu = (
             "down_proj" in getattr(layer, "prefix", "")
             and envs_ascend.VLLM_ASCEND_ENABLE_SWIGLU_MX_QUANT_OPS
-            # gate_up input has 2x hidden dim; swiglu-activated input matches
-            # weight dim.  Only fuse swiglu when the input is the un-activated
-            # gate_up tensor (shape [*, 2K]) rather than post-activation ([*, K]).
-            and x.shape[-1] == layer.weight.shape[-1] * 2
         )
 
         if is_down_proj_with_swiglu:

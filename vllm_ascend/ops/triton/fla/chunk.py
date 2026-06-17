@@ -16,15 +16,51 @@ from vllm.distributed import get_pcp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fla.ops.utils import SUPPRESS_LEVEL
 
+from vllm_ascend import envs
+
 from .chunk_delta_h import chunk_gated_delta_rule_fwd_h  # noqa: F401
 from .chunk_delta_hupdate import chunk_gated_delta_rule_fwd_hupdate
 from .chunk_o import chunk_fwd_o  # noqa: F401
-from .chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from .cumsum import chunk_local_cumsum
 from .l2norm import l2norm_fwd
-from .solve_tril import solve_tril
 from .utils import input_guard, prepare_final_chunk_indices
-from .wy_fast import recompute_w_u_fwd
+
+def _build_chunk_offsets_idx_from_cu_seqlens(
+    cu_seqlens: torch.Tensor,
+    chunk_size: int,
+) -> torch.Tensor:
+    """Build chunk_offsets_idx from cu_seqlens when prebuilt_meta is unavailable.
+
+    This produces the same tensor as _fill_chunk_offsets_idx_cpu/_device in
+    gdn_attn_builder.py, but is computed on-the-fly as a fallback.
+    """
+    cu_seqlens_cpu = cu_seqlens.cpu() if cu_seqlens.device.type != "cpu" else cu_seqlens
+    # Compute total number of chunks to determine output size
+    seq_lens = cu_seqlens_cpu[1:] - cu_seqlens_cpu[:-1]
+    chunk_counts = (seq_lens + chunk_size - 1) // chunk_size
+    num_chunks = int(chunk_counts.sum().item())
+
+    out = torch.empty(num_chunks + 1, dtype=torch.int32, device=cu_seqlens.device)
+    # Fill on CPU then copy to device (same pattern as _fill_chunk_offsets_idx_device)
+    out_cpu = torch.empty(num_chunks + 1, dtype=torch.int32)
+    seq_idx = 0
+    last_seqlens = 0
+    out_cpu[0] = 0
+    idx = 1
+    for _, seqlens in enumerate(cu_seqlens_cpu[1:].tolist()):
+        if seqlens == last_seqlens:
+            continue
+        else:
+            last_seqlens = seqlens
+        while seq_idx + chunk_size < seqlens:
+            seq_idx += chunk_size
+            out_cpu[idx] = seq_idx
+            idx += 1
+        seq_idx = seqlens
+        out_cpu[idx] = seq_idx
+        idx += 1
+    out[:idx].copy_(out_cpu[:idx])
+    return out
 
 
 def chunk_gated_delta_rule_fwd(
@@ -47,6 +83,7 @@ def chunk_gated_delta_rule_fwd(
     if attn_metadata is not None:
         num_decodes = attn_metadata.num_decodes
     chunk_size = 64
+    use_cloud_ops = not envs.VLLM_ASCEND_DISABLE_CLOUD_OPS_TURBO
     block_indices_cumsum = None if prebuilt_meta is None else prebuilt_meta.block_indices_cumsum
     cu_seqlens_host = None if prebuilt_meta is None else prebuilt_meta.cu_seqlens_host
     chunk_indices_chunk64 = None if prebuilt_meta is None else prebuilt_meta.chunk_indices_chunk64
@@ -55,6 +92,11 @@ def chunk_gated_delta_rule_fwd(
     update_chunk_offsets_chunk64 = None if prebuilt_meta is None else prebuilt_meta.update_chunk_offsets_chunk64
     final_chunk_indices_chunk64 = None if prebuilt_meta is None else prebuilt_meta.final_chunk_indices_chunk64
     chunk_indices_large_block = None if prebuilt_meta is None else prebuilt_meta.chunk_indices_large_block
+    chunk_offsets_idx = None if prebuilt_meta is None else prebuilt_meta.chunk_offsets_idx
+    # Fallback: build chunk_offsets_idx from cu_seqlens when prebuilt_meta is
+    # unavailable (e.g., cudagraph capture path or non-Ascend builder path).
+    if chunk_offsets_idx is None and cu_seqlens is not None:
+        chunk_offsets_idx = _build_chunk_offsets_idx_from_cu_seqlens(cu_seqlens, chunk_size)
     g = chunk_local_cumsum(
         g,
         chunk_size=chunk_size,
@@ -62,30 +104,59 @@ def chunk_gated_delta_rule_fwd(
         block_indices=block_indices_cumsum,
     )
     # obtain WY representation. u is actually the new v.
-    A = chunk_scaled_dot_kkt_fwd(
-        k=k,
-        beta=beta,
-        g_cumsum=g,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices_chunk64,
-        output_dtype=torch.float32,
-    )
-    A = solve_tril(
-        A=A,
-        cu_seqlens=cu_seqlens,
-        chunk_indices_large_block=chunk_indices_large_block,
-        chunk_indices_bt=chunk_indices_chunk64,
-        output_dtype=k.dtype,
-    )
-    w, u = recompute_w_u_fwd(
-        k=k,
-        v=v,
-        beta=beta,
-        A=A,
-        g_cumsum=g,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices_chunk64,
-    )
+    if use_cloud_ops:
+        import cloud_ops_turbo  # Lazy import to avoid loading SO at module import time
+        beta_bht = beta.transpose(1, 2).contiguous()
+        g_bht = g.transpose(1, 2).contiguous()
+
+        def _tensor_info(t):
+            if t is None:
+                return "None"
+            return f"shape={tuple(t.shape)}, dtype={t.dtype}, device={t.device}"
+
+        A = torch.ops.cloud_ops_turbo.cloud_chunk_scaled_dot_kkt(
+            k, beta_bht, g_bht, chunk_offsets_idx, chunk_size=chunk_size,
+        )
+
+        A = torch.ops.cloud_ops_turbo.cloud_solve_tril(A, chunk_offsets_idx)
+
+        w, u = torch.ops.cloud_ops_turbo.cloud_recompute_wu(
+            k, v, A, beta_bht, g_bht, chunk_offsets_idx, chunk_size=chunk_size,
+        )
+
+        # cloud_recompute_wu returns w: [B, H, T, K], u: [B, H, T, V] (head-first).
+        # Transpose to [B, T, H, K/V] (time-first) for downstream Triton kernels.
+        w = w.transpose(1, 2).contiguous()
+        u = u.transpose(1, 2).contiguous()
+    else:
+        from .chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
+        from .solve_tril import solve_tril
+        from .wy_fast import recompute_w_u_fwd
+
+        A = chunk_scaled_dot_kkt_fwd(
+            k=k,
+            beta=beta,
+            g_cumsum=g,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices_chunk64,
+            output_dtype=torch.float32,
+        )
+        A = solve_tril(
+            A=A,
+            cu_seqlens=cu_seqlens,
+            chunk_indices_large_block=chunk_indices_large_block,
+            chunk_indices_bt=chunk_indices_chunk64,
+            output_dtype=k.dtype,
+        )
+        w, u = recompute_w_u_fwd(
+            k=k,
+            v=v,
+            beta=beta,
+            A=A,
+            g_cumsum=g,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices_chunk64,
+        )
 
     k_ascendc = k.to(torch.bfloat16).transpose(1, 2).contiguous()
     w_ascendc = w.to(torch.bfloat16).transpose(1, 2).contiguous()
@@ -96,9 +167,9 @@ def chunk_gated_delta_rule_fwd(
     cu_seqlens = None if cu_seqlens is None else cu_seqlens.to(torch.int64)
     chunk_indices = None if chunk_indices_chunk64 is None else chunk_indices_chunk64.to(torch.int64)
     if cu_seqlens_host is None and cu_seqlens is not None:
-        cu_seqlens_host = tuple(cu_seqlens.tolist())
+        cu_seqlens_host = tuple(cu_seqlens.cpu().tolist())
     if chunk_indices_chunk64_host is None and chunk_indices is not None:
-        chunk_indices_chunk64_host = tuple(chunk_indices.flatten().tolist())
+        chunk_indices_chunk64_host = tuple(chunk_indices.cpu().flatten().tolist())
     h, v_new, final_state = torch.ops._C_ascend.chunk_gated_delta_rule_fwd_h(
         k_ascendc,
         w_ascendc,

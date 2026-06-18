@@ -30,12 +30,16 @@ from vllm_ascend.attention.utils import (
     ascend_chunked_prefill_workspace_size,
     enable_cp,
     maybe_save_kv_layer_to_connector,
+    notify_kv_cache_written,
     trans_rope_weight,
     transdata,
     wait_for_kv_layer_from_connector,
 )
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.utils import all_gather_async
+from vllm_ascend.memcache_comm_fence import (
+    record_attention_compute_start,
+)
 from vllm_ascend.ops.layer_shard_linear import (
     is_hidden_layer,
     post_process_after_loading_for_shard_weight_series,
@@ -983,55 +987,20 @@ class AscendSFAImpl(MLAAttentionImpl):
             q_li, q_li_scale = torch_npu.npu_dynamic_quant(q_li.view(-1, self.head_dim), dst_type=self.c8_k_cache_dtype)
             q_li_scale = q_li_scale.to(self.c8_k_scale_cache_dtype)
 
-        # DSV3.2 currently has graph compilation issues when using torch_npu.npu.lightning_indexer.
-        # So two branches are maintained temporarily.
-        # TODO: torch.ops._C_ascend.npu_lightning_indexer needs to be removed.
-        if self.use_sparse_c8_indexer:
-            assert len(kv_cache) == 4
-            weights = weights.to(torch.float16)
-            topk_indices = torch.ops._C_ascend.npu_lightning_indexer_quant(
-                query=q_li.view(q_li_shape_ori),
-                key=kv_cache[2],
-                weights=weights,
-                query_dequant_scale=q_li_scale.view(q_li_shape_ori[:-1]),
-                key_dequant_scale=kv_cache[3].squeeze(2),  # B S N D -> B S D
-                actual_seq_lengths_query=actual_seq_lengths_query,
-                actual_seq_lengths_key=actual_seq_lengths_key,
-                block_table=attn_metadata.block_table,
-                query_quant_mode=0,
-                key_quant_mode=0,
-                layout_query="TND",
-                layout_key="PA_BSND",
-                sparse_count=2048,
-                sparse_mode=3,
-            )
-        elif self.use_torch_npu_lightning_indexer:
-            topk_indices, _ = torch_npu.npu_lightning_indexer(
-                query=q_li,
-                key=kv_cache[2],
-                weights=weights,
-                actual_seq_lengths_query=actual_seq_lengths_query,
-                actual_seq_lengths_key=actual_seq_lengths_key,
-                block_table=attn_metadata.block_table,
-                layout_query="TND",
-                layout_key="PA_BSND",
-                sparse_count=2048,
-                sparse_mode=3,
-            )
-        else:
-            topk_indices = torch.ops._C_ascend.npu_lightning_indexer(
-                query=q_li,
-                key=kv_cache[2],
-                weights=weights,
-                actual_seq_lengths_query=actual_seq_lengths_query,
-                actual_seq_lengths_key=actual_seq_lengths_key,
-                block_table=attn_metadata.block_table,
-                layout_query="TND",
-                layout_key="PA_BSND",
-                sparse_count=2048,
-                sparse_mode=3,
-            )
-        return topk_indices
+        record_attention_compute_start()
+        return DeviceOperator.indexer_select_post_process(
+            self,
+            q_li,
+            q_li_scale,
+            q_li_shape_ori,
+            weights,
+            kv_cache,
+            attn_metadata,
+            actual_seq_lengths_query,
+            actual_seq_lengths_key,
+            self.use_sparse_c8_indexer,
+            self.use_torch_npu_lightning_indexer,
+        )
 
     def _get_indexcache_topk_indices(self, num_tokens: int) -> torch.Tensor:
         if self.topk_indices_buffer is None:
@@ -1240,21 +1209,50 @@ class AscendSFAImpl(MLAAttentionImpl):
             k_li = self._get_full_kv(k_li, attn_metadata)
 
         if kv_cache is not None:
-            if self.is_kv_producer:
-                attn_metadata.reshape_cache_event = torch.npu.Event()
-            torch_npu.npu_scatter_nd_update_(
-                kv_cache[2].view(-1, k_li.shape[-1]), slot_mapping.view(-1, 1), k_li.view(-1, k_li.shape[-1])
-            )  # b, s, n, d
-            if self.use_sparse_c8_indexer:
-                assert len(kv_cache) == 4
-                assert k_li_scale is not None
-                torch_npu.npu_scatter_nd_update_(
-                    kv_cache[3].view(-1, k_li_scale.shape[-1]),
-                    slot_mapping.view(-1, 1),
-                    k_li_scale.view(-1, k_li_scale.shape[-1]),
+            if self.use_sparse_c8_indexer and get_ascend_device_type() == AscendDeviceType.A5:
+                dsa_k_cache_idx = 1
+                dsa_k_scale_cache_idx = 2
+            else:
+                dsa_k_cache_idx = 2
+                dsa_k_scale_cache_idx = 3
+
+            if self.is_kv_producer and get_ascend_config().c8_enable_reshape_optim:
+                torch.ops._C_ascend.store_kv_block(
+                    k_li,
+                    kv_cache[dsa_k_cache_idx],
+                    attn_metadata.group_len,
+                    attn_metadata.group_key_idx,
+                    attn_metadata.group_key_cache_idx,
+                    attn_metadata.block_size,
                 )
-            if self.is_kv_producer:
-                attn_metadata.reshape_cache_event.record()
+            else:
+                torch_npu.npu_scatter_nd_update_(
+                    kv_cache[dsa_k_cache_idx].view(-1, k_li.shape[-1]),
+                    slot_mapping.view(-1, 1),
+                    k_li.view(-1, k_li.shape[-1]),
+                )  # b, s, n, d
+            if self.use_sparse_c8_indexer:
+                if get_ascend_device_type() == AscendDeviceType.A5:
+                    assert len(kv_cache) == 3
+                else:
+                    assert len(kv_cache) == 4
+                if k_li_scale is not None:
+                    if self.is_kv_producer and get_ascend_config().c8_enable_reshape_optim:
+                        torch.ops._C_ascend.store_kv_block(
+                            k_li_scale,
+                            kv_cache[dsa_k_scale_cache_idx],
+                            attn_metadata.group_len,
+                            attn_metadata.group_key_idx,
+                            attn_metadata.group_key_cache_idx,
+                            attn_metadata.block_size,
+                        )
+                    else:
+                        torch_npu.npu_scatter_nd_update_(
+                            kv_cache[dsa_k_scale_cache_idx].view(-1, k_li_scale.shape[-1]),
+                            slot_mapping.view(-1, 1),
+                            k_li_scale.view(-1, k_li_scale.shape[-1]),
+                        )
+            notify_kv_cache_written(self.layer_name or "")
 
         topk_num_tokens = num_input_tokens or hidden_states.shape[0]
         if self.skip_topk:

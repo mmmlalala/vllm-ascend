@@ -33,6 +33,8 @@ from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner  # 
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
+from vllm_ascend.device.device_op import DeviceOperator
+from vllm_ascend.device.mxfp_compat import FLOAT8_E8M0FNU_DTYPE
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.eplb.core.eplb_utils import init_eplb_config
 from vllm_ascend.flash_common3_context import get_flash_common3_context, set_flash_common3_context
@@ -442,6 +444,11 @@ class AscendFusedMoE(FusedMoE):
         self.moe_config.num_local_experts = self.local_num_experts
         self.moe_config.global_redundant_expert_num = self.global_redundant_expert_num
         self.swiglu_limit = getattr(self.vllm_config.model_config.hf_config, "swiglu_limit", 0)
+        self.mxfp_group_size = (
+            self.quant_config.quant_description.get("group_size", 32)
+            if self.quant_config is not None
+            else 32
+        )
 
         moe_quant_params = {
             "num_experts": self.local_num_experts,
@@ -499,7 +506,7 @@ class AscendFusedMoE(FusedMoE):
         part1_out = self._shared_experts_part1(test_input)
         split_out = self._shared_experts_part2(test_input, part1_out)
 
-        if not torch.allclose(integrated_out, split_out):
+        if not torch.allclose(integrated_out, split_out, atol=1e-2, rtol=1e-3):
             diff = (integrated_out - split_out).abs()
             logger.error("FusedMoE shared experts split computation does not match the integrated computation.")
             logger.error("Max absolute difference: %s", diff.max().item())
@@ -511,15 +518,57 @@ class AscendFusedMoE(FusedMoE):
         logger.info_once("FusedMoE shared experts split computation matches the integrated computation.")
 
     def _shared_experts_part1(self, hidden_states: torch.Tensor):
-        shared_gate_up, _ = self._shared_experts.gate_up_proj(hidden_states)  # type: ignore
-        return shared_gate_up
-
-    def _shared_experts_part2(self, hidden_states: torch.Tensor, shared_gate_up: torch.Tensor):
-        down_proj_is_mxfp8 = (
+        use_fused_swiglu_quant = (
             envs_ascend.VLLM_ASCEND_ENABLE_SWIGLU_MX_QUANT_OPS
+            and hasattr(self._shared_experts.gate_up_proj, "weight_scale")
             and hasattr(self._shared_experts.down_proj, "weight_scale")
         )
-        if down_proj_is_mxfp8:
+        if use_fused_swiglu_quant:
+            # Fused path: quant -> gmm_swiglu_quant (gate_up_proj + swiglu + quant)
+            # Returns quantized activation + scale, bypassing bf16 intermediate
+            quantized_x, pertoken_scale = torch_npu.npu_dynamic_mx_quant(
+                hidden_states, dst_type=torch.float8_e4m3fn
+            )
+            pertoken_scale = DeviceOperator.maybe_normalize_mxfp_scale_layout(pertoken_scale)
+
+            num_tokens = hidden_states.shape[0]
+            group_list = torch.tensor([0, num_tokens], dtype=torch.int64, device=hidden_states.device)
+
+            swiglu_out, swiglu_out_scale, _ = DeviceOperator.npu_grouped_matmul_swiglu_quant(
+                x=quantized_x,
+                weight=self._shared_experts.gate_up_proj.weight,
+                group_list=group_list,
+                weight_scale=self._shared_experts.gate_up_proj.weight_scale,
+                x_scale=pertoken_scale,
+                use_mxfp_quant=True,
+                act_quant_type=torch.float8_e4m3fn,
+                weight_quant_type=torch.float8_e4m3fn,
+                swiglu_limit=self.swiglu_limit,
+            )
+            return swiglu_out, swiglu_out_scale
+        else:
+            shared_gate_up, _ = self._shared_experts.gate_up_proj(hidden_states)  # type: ignore
+            return shared_gate_up
+
+    def _shared_experts_part2(self, hidden_states: torch.Tensor, shared_gate_up):
+        if isinstance(shared_gate_up, tuple):
+            # Fused path: shared_gate_up is (quantized_activation, scale)
+            quantized_x, swiglu_out_scale = shared_gate_up
+            shared_out = torch_npu.npu_quant_matmul(
+                quantized_x,
+                self._shared_experts.down_proj.weight,
+                self._shared_experts.down_proj.weight_scale,
+                scale_dtype=FLOAT8_E8M0FNU_DTYPE,
+                pertoken_scale=swiglu_out_scale,
+                pertoken_scale_dtype=FLOAT8_E8M0FNU_DTYPE,
+                bias=None,
+                output_dtype=hidden_states.dtype,
+                group_sizes=[1, 1, self.mxfp_group_size],
+            )
+        elif (
+            envs_ascend.VLLM_ASCEND_ENABLE_SWIGLU_MX_QUANT_OPS
+            and hasattr(self._shared_experts.down_proj, "weight_scale")
+        ):
             shared_out, _ = self._shared_experts.down_proj(shared_gate_up)  # type: ignore
         else:
             shared_act = self._shared_experts.act_fn(shared_gate_up)  # type: ignore

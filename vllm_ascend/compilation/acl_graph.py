@@ -23,6 +23,32 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 
 from ..utils import weak_ref_tensors
 
+_acl_graph_wrappers: weakref.WeakSet[Any] = weakref.WeakSet()
+_STREAM_RESOURCE_ERROR_CODE = "207008"
+_STREAM_RESOURCE_ERROR_MARKERS = (
+    "insufficient_stream_resources",
+    "stream resources are insufficient",
+)
+_STREAM_RESOURCE_GUIDANCE = (
+    "ACL graph capture failed with a known stream-resource exhaustion "
+    "signature. Consider upgrading to a newer HDK/CANN stack, reducing "
+    "cudagraph_capture_sizes, lowering max_cudagraph_capture_size, preferring "
+    "FULL or FULL_DECODE_ONLY for mostly uniform decode workloads, or "
+    "temporarily disabling graph mode to confirm the failure is capture-related."
+)
+
+
+def _is_stream_resource_capture_error(exc: RuntimeError) -> bool:
+    message = str(exc)
+    lowered_message = message.lower()
+    has_error_code = _STREAM_RESOURCE_ERROR_CODE in message
+    has_stream_resource_marker = any(marker in lowered_message for marker in _STREAM_RESOURCE_ERROR_MARKERS)
+    return has_stream_resource_marker or (has_error_code and "stream resource" in lowered_message)
+
+
+def _raise_stream_resource_capture_error(exc: RuntimeError) -> None:
+    raise RuntimeError(f"{_STREAM_RESOURCE_GUIDANCE}\nOriginal error:\n{exc}") from exc
+
 
 @dataclasses.dataclass
 class ACLGraphEntry:
@@ -92,6 +118,7 @@ class ACLGraphWrapper:
         self.concrete_aclgraph_entries: dict[BatchDescriptor, ACLGraphEntry] = {}
         self.enable_enpu = enable_enpu
         self.use_eagle = use_eagle
+        _acl_graph_wrappers.add(self)
 
     def __getattr__(self, key: str):
         # allow accessing the attributes of the runnable.

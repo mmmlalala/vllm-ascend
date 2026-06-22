@@ -114,9 +114,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_APPLY_DSV4_PATCH": lambda: bool(int(os.getenv("VLLM_ASCEND_APPLY_DSV4_PATCH", "0"))),
     # Whether to disable cloud_ops_turbo custom AscendC operators and fall back
     # to Triton implementations. Set to 1 to use legacy Triton path for debugging.
-    # Each operator can be individually controlled:
     #   0: use cloud_ops_turbo (default)
-    #   1: disable all three operators
+    #   1: disable all cloud_ops_turbo operators (cloud_chunk_scaled_dot_kkt,
+    #      cloud_solve_tril, cloud_recompute_wu, cloud_rmsnorm_silu)
     "VLLM_ASCEND_DISABLE_CLOUD_OPS_TURBO": lambda: bool(int(os.getenv("VLLM_ASCEND_DISABLE_CLOUD_OPS_TURBO", "0"))),
 }
 

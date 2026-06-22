@@ -142,7 +142,7 @@ class LayerNormFn(torch.autograd.Function):
         if bias is not None:
             bias = bias.contiguous()
 
-        if envs.VLLM_ASCEND_ENABLE_CLOUD_RMSNORM_SILU:
+        if not envs.VLLM_ASCEND_DISABLE_CLOUD_OPS_TURBO:
             import cloud_ops_turbo
             y = torch.ops.cloud_ops_turbo.cloud_rmsnorm_silu(x, weight, z, eps)
             mean = None

@@ -114,15 +114,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_APPLY_DSV4_PATCH": lambda: bool(int(os.getenv("VLLM_ASCEND_APPLY_DSV4_PATCH", "0"))),
     # Whether to disable cloud_ops_turbo custom AscendC operators and fall back
     # to Triton implementations. Set to 1 to use legacy Triton path for debugging.
-    # Each operator can be individually controlled:
     #   0: use cloud_ops_turbo (default)
-    #   1: disable all three operators
+    #   1: disable all cloud_ops_turbo operators (cloud_chunk_scaled_dot_kkt,
+    #      cloud_solve_tril, cloud_recompute_wu, cloud_rmsnorm_silu)
     "VLLM_ASCEND_DISABLE_CLOUD_OPS_TURBO": lambda: bool(int(os.getenv("VLLM_ASCEND_DISABLE_CLOUD_OPS_TURBO", "0"))),
-    # Whether to enable cloud_rmsnorm_silu fused AscendC operator for gated RMS norm.
-    # This fuses rms_norm(x) * weight * silu(z) into a single kernel, improving
-    # performance for Qwen3.5 MoE models.
-    # Default is 0 (disabled). Set to 1 to enable.
-    "VLLM_ASCEND_ENABLE_CLOUD_RMSNORM_SILU": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_CLOUD_RMSNORM_SILU", "0"))),
 }
 
 # end-env-vars-definition

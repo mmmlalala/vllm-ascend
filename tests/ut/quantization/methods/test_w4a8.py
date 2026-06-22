@@ -4,14 +4,13 @@ import regex as re
 import torch
 
 from tests.ut.base import TestBase
-from tests.ut.conftest import npu_test
 from tests.ut.quantization.conftest_quantization import identity
 from vllm_ascend.quantization.methods.w4a8 import AscendW4A8DynamicFusedMoEMethod, AscendW4A8DynamicLinearMethod
 from vllm_ascend.utils import COMPRESSED_TENSORS_METHOD
 
 
 class TestAscendW4A8DynamicLinearMethod(TestBase):
-    @patch("vllm.distributed.get_tensor_model_parallel_world_size")
+    @patch("vllm_ascend.quantization.methods.w4a8.get_tensor_model_parallel_world_size")
     @patch("vllm_ascend.quantization.methods.w4a8.get_current_vllm_config")
     def setUp(self, mock_get_current_vllm_config, mock_get_tp_world_size):
         mock_get_tp_world_size.return_value = 1
@@ -55,12 +54,16 @@ class TestAscendW4A8DynamicLinearMethod(TestBase):
         self.assertEqual(params["scale_bias"].dtype, torch.float32)
         self.assertEqual(params["scale_bias"].shape, (32, 16))
 
+    @patch("vllm_ascend.quantization.methods.w4a8.maybe_trans_nz")
     @patch("torch_npu.npu_convert_weight_to_int4pack")
     @patch("torch.Tensor.npu")
     @patch("torch_npu.npu_format_cast")
-    def test_process_weights_after_loading(self, mock_format_cast, mock_npu, mock_npu_convert_weight):
+    def test_process_weights_after_loading(
+        self, mock_format_cast, mock_npu, mock_npu_convert_weight, mock_maybe_trans_nz
+    ):
         mock_npu.side_effect = lambda: torch.zeros((1, 32), dtype=torch.float32)
         mock_npu_convert_weight.return_value = torch.zeros((32, 4), dtype=torch.int32)
+        mock_maybe_trans_nz.side_effect = identity
         # old quant version weight
         layer = torch.nn.Module()
         layer.weight = torch.nn.Parameter(torch.zeros((32, 8), dtype=torch.int8), requires_grad=False)
@@ -126,9 +129,8 @@ class TestAscendW4A8DynamicLinearMethod(TestBase):
             self.method.process_weights_after_loading(layer)
 
 
-@npu_test(num_npus=1, npu_type="a2")
 class TestAscendW4A8DynamicLinearMethodWithNpu(TestBase):
-    @patch("vllm.distributed.get_tensor_model_parallel_world_size")
+    @patch("vllm_ascend.quantization.methods.w4a8.get_tensor_model_parallel_world_size")
     @patch("vllm_ascend.quantization.methods.w4a8.get_current_vllm_config")
     def setUp(self, mock_get_current_vllm_config, mock_get_tp_world_size):
         mock_get_tp_world_size.return_value = 1
@@ -159,12 +161,9 @@ class TestAscendW4A8DynamicFusedMoEMethod(TestBase):
 
     @patch("vllm_ascend.quantization.methods.w4a8.get_ascend_config")
     @patch("vllm_ascend.quantization.methods.w4a8.get_current_vllm_config")
-    @patch("vllm_ascend.quantization.methods.w4a8.get_ep_group")
     @patch("vllm_ascend.quantization.methods.w4a8.get_mc2_group")
     @patch("torch.distributed.get_rank", return_value=0)
-    def setUp(
-        self, mock_get_rank, mock_get_mc2_group, mock_get_ep_group, get_current_vllm_config, mock_get_ascend_config
-    ):
+    def setUp(self, mock_get_rank, mock_get_mc2_group, get_current_vllm_config, mock_get_ascend_config):
         # Mock ascend config
         mock_ascend_config = Mock()
         mock_ascend_config.eplb_config.dynamic_eplb = False
@@ -281,12 +280,14 @@ class TestAscendW4A8DynamicFusedMoEMethod(TestBase):
             )
         return layer
 
+    @patch("vllm_ascend.quantization.methods.w4a8.maybe_trans_nz")
     @patch("torch_npu.npu_format_cast")
     @patch("torch_npu.npu_quantize")
     @patch("torch.Tensor.npu", new=lambda self: self)
-    def test_process_weights_after_loading(self, mock_npu_quantize, mock_npu_format_cast):
+    def test_process_weights_after_loading(self, mock_npu_quantize, mock_npu_format_cast, mock_maybe_trans_nz):
         mock_npu_quantize.return_value = torch.Tensor()
         mock_npu_format_cast.side_effect = identity
+        mock_maybe_trans_nz.side_effect = identity
         # old quant version weight
         layer = self.build_layer(is_new_quant_version=False)
         self.quant_method.process_weights_after_loading(layer)
@@ -333,13 +334,16 @@ class TestAscendW4A8DynamicFusedMoEMethod(TestBase):
         self.assertEqual(result["w13_weight_scale"].dtype, torch.bfloat16)
         self.assertEqual(result["w2_weight_scale"].dtype, torch.bfloat16)
 
+    @patch("vllm_ascend.quantization.methods.w4a8.maybe_trans_nz")
     @patch("torch_npu.npu_format_cast")
     @patch("torch_npu.npu_quantize")
-    @patch("torch.Tensor.npu")
-    def test_process_weights_after_loading_compressed_tensors(self, mock_npu, mock_npu_quantize, mock_npu_format_cast):
-        mock_npu.return_value = torch.Tensor()
+    @patch("torch.Tensor.npu", new=lambda self: self)
+    def test_process_weights_after_loading_compressed_tensors(
+        self, mock_npu_quantize, mock_npu_format_cast, mock_maybe_trans_nz
+    ):
         mock_npu_quantize.return_value = torch.Tensor()
         mock_npu_format_cast.side_effect = identity
+        mock_maybe_trans_nz.side_effect = identity
 
         layer = self.build_layer(is_new_quant_version=False)
         self.quant_method.quant_method = COMPRESSED_TENSORS_METHOD
@@ -348,6 +352,13 @@ class TestAscendW4A8DynamicFusedMoEMethod(TestBase):
         self.assertTrue(hasattr(layer, "w13_scale_bias"))
         self.assertEqual(layer.w13_scale_bias.data.shape, (self.experts, 2 * self.input_size))
         self.assertEqual(layer.w13_scale_bias.data.dtype, torch.float32)
+
+        self.quant_method.is_per_channel_weight = True
+        self.quant_method.weight_strategy = "channel"
+        per_channel_layer = self.build_layer(is_new_quant_version=False)
+        self.quant_method.process_weights_after_loading(per_channel_layer)
+        self.assertEqual(per_channel_layer.w13_weight_scale.data.shape, (self.experts, 2 * self.input_size))
+        self.assertEqual(per_channel_layer.w2_weight_scale.data.shape, (self.experts, 1, self.output_size))
 
     @patch("vllm_ascend.quantization.methods.w4a8._EXTRA_CTX")
     @patch("vllm_ascend.quantization.methods.w4a8.select_experts")

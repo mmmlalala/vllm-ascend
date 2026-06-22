@@ -20,6 +20,7 @@ from torch import nn
 from vllm.config import get_current_vllm_config
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm, RMSNormGated
 
+import vllm_ascend.envs as envs
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.triton.layernorm_gated import layer_norm_fwd_npu
 from vllm_ascend.utils import enable_custom_op, get_weight_prefetch_method
@@ -140,16 +141,24 @@ class LayerNormFn(torch.autograd.Function):
         weight = weight.contiguous()
         if bias is not None:
             bias = bias.contiguous()
-        y, mean, rstd = layer_norm_fwd_npu(
-            x,
-            weight,
-            bias,
-            eps,
-            z=z,
-            group_size=group_size,
-            norm_before_gate=norm_before_gate,
-            is_rms_norm=is_rms_norm,
-        )
+
+        if envs.VLLM_ASCEND_ENABLE_CLOUD_RMSNORM_SILU:
+            import cloud_ops_turbo
+            y = torch.ops.cloud_ops_turbo.cloud_rmsnorm_silu(x, weight, z, eps)
+            mean = None
+            rstd = None
+        else:
+            y, mean, rstd = layer_norm_fwd_npu(
+                x,
+                weight,
+                bias,
+                eps,
+                z=z,
+                group_size=group_size,
+                norm_before_gate=norm_before_gate,
+                is_rms_norm=is_rms_norm,
+            )
+
         ctx.save_for_backward(x, weight, bias, mean, rstd, z)
         ctx.x_shape_og = x_shape_og
         ctx.eps = eps

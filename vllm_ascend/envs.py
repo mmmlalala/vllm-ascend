@@ -118,6 +118,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     #   0: use cloud_ops_turbo (default)
     #   1: disable all three operators
     "VLLM_ASCEND_DISABLE_CLOUD_OPS_TURBO": lambda: bool(int(os.getenv("VLLM_ASCEND_DISABLE_CLOUD_OPS_TURBO", "0"))),
+    # Whether to enable cloud_rmsnorm_silu fused AscendC operator for gated RMS norm.
+    # This fuses rms_norm(x) * weight * silu(z) into a single kernel, improving
+    # performance for Qwen3.5 MoE models.
+    # Default is 0 (disabled). Set to 1 to enable.
+    "VLLM_ASCEND_ENABLE_CLOUD_RMSNORM_SILU": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_CLOUD_RMSNORM_SILU", "0"))),
 }
 
 # end-env-vars-definition

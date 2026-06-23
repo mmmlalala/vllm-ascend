@@ -15,6 +15,8 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
+from typing import Any
+
 import torch
 import torch_npu
 from vllm.triton_utils import HAS_TRITON

@@ -156,6 +156,33 @@ def _build_chunk_offsets(
         torch.cumsum(chunk_counts + add_one, dim=0, out=out_offsets[1:])
 
 
+def _fill_chunk_offsets_idx_device(out: torch.Tensor, cu_seqlens: torch.Tensor, chunk_size: int) -> int:
+    if out is None:
+        return 0
+    cu_seqlens_cpu = cu_seqlens.cpu() if cu_seqlens.device.type != "cpu" else cu_seqlens
+    # Build on CPU first, then copy to device in one shot to avoid
+    # per-element NPU kernel launches.
+    out_cpu = torch.empty(out.shape[0], dtype=torch.int32)
+    seq_idx = 0
+    last_seqlens = 0
+    out_cpu[0] = 0
+    idx = 1
+    for _, seqlens in enumerate(cu_seqlens_cpu.tolist()):
+        if seqlens == last_seqlens:
+            continue
+        else:
+            last_seqlens = seqlens
+        while seq_idx + chunk_size < seqlens:
+            seq_idx += chunk_size
+            out_cpu[idx] = seq_idx
+            idx += 1
+        seq_idx = seqlens
+        out_cpu[idx] = seq_idx
+        idx += 1
+    out[:idx].copy_(out_cpu[:idx])
+    return idx
+
+
 def _build_final_chunk_indices(
     chunk_counts: torch.Tensor,
     update_chunk_offsets: torch.Tensor,
@@ -179,18 +206,21 @@ def _build_final_chunk_indices(
 
 
 def _build_chunk_meta_device_from_seq_lens(
+    cu_seqlens: torch.Tensor,
     seq_lens: torch.Tensor,
     chunk_size: int,
     out_chunk_indices: torch.Tensor | None = None,
     out_chunk_offsets: torch.Tensor | None = None,
     out_update_chunk_offsets: torch.Tensor | None = None,
     out_final_chunk_indices: torch.Tensor | None = None,
+    out_chunk_offsets_idx: torch.Tensor | None = None,
 ) -> None:
     if (
         out_chunk_indices is None
         and out_chunk_offsets is None
         and out_update_chunk_offsets is None
         and out_final_chunk_indices is None
+        and out_chunk_offsets_idx is None
     ):
         return
 
@@ -235,9 +265,18 @@ def _build_chunk_meta_device_from_seq_lens(
             out_update_chunk_offsets.zero_()
         if out_final_chunk_indices is not None:
             out_final_chunk_indices.zero_()
+        if out_chunk_offsets_idx is not None:
+            out_chunk_offsets_idx.zero_()
         return
 
     chunk_counts = _build_chunk_counts(seq_lens, chunk_size)
+
+    _validate_optional_output(
+        "out_chunk_offsets_idx",
+        out_chunk_offsets_idx,
+        expected_shape=None,
+        expected_device=seq_lens.device,
+    )
 
     chunk_offsets = out_chunk_offsets
     if chunk_offsets is None and out_chunk_indices is not None:
@@ -259,6 +298,8 @@ def _build_chunk_meta_device_from_seq_lens(
 
     if update_chunk_offsets is not None:
         _build_chunk_offsets(chunk_counts, update_chunk_offsets, add_one=1)
+
+    _fill_chunk_offsets_idx_device(out_chunk_offsets_idx, cu_seqlens, chunk_size)
 
     if out_final_chunk_indices is not None:
         _build_final_chunk_indices(
@@ -286,6 +327,7 @@ def build_chunk_meta_device(
     out_chunk_offsets: torch.Tensor | None = None,
     out_update_chunk_offsets: torch.Tensor | None = None,
     out_final_chunk_indices: torch.Tensor | None = None,
+    out_chunk_offsets_idx: torch.Tensor | None = None,
     *,
     seq_lens: torch.Tensor | None = None,
     validate_inputs: bool = True,
@@ -295,10 +337,12 @@ def build_chunk_meta_device(
     elif chunk_size <= 0:
         raise ValueError(f"chunk_gated_delta_rule meta: chunk_size must be positive, got {chunk_size}")
     _build_chunk_meta_device_from_seq_lens(
+        cu_seqlens,
         _build_seq_lens(cu_seqlens) if seq_lens is None else seq_lens,
         chunk_size,
         out_chunk_indices=out_chunk_indices,
         out_chunk_offsets=out_chunk_offsets,
         out_update_chunk_offsets=out_update_chunk_offsets,
         out_final_chunk_indices=out_final_chunk_indices,
+        out_chunk_offsets_idx=out_chunk_offsets_idx,
     )

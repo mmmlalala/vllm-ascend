@@ -21,7 +21,10 @@ from vllm.config import get_current_vllm_config
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm, RMSNormGated
 
 import vllm_ascend.envs as envs
+import cloud_ops_turbo  # noqa: F401
 from vllm_ascend.device.device_op import DeviceOperator
+
+_USE_CLOUD_OPS = not envs.VLLM_ASCEND_DISABLE_CLOUD_OPS_TURBO
 from vllm_ascend.ops.triton.layernorm_gated import layer_norm_fwd_npu
 from vllm_ascend.utils import enable_custom_op, get_weight_prefetch_method
 
@@ -141,8 +144,7 @@ class LayerNormFn(torch.autograd.Function):
         weight = weight.contiguous()
         if bias is not None:
             bias = bias.contiguous()
-        if not envs.VLLM_ASCEND_DISABLE_CLOUD_OPS_TURBO:
-            import cloud_ops_turbo
+        if _USE_CLOUD_OPS:
             y = torch.ops.cloud_ops_turbo.cloud_rmsnorm_silu(x, weight, z, eps)
             mean = None
             rstd = None

@@ -18,6 +18,8 @@ from vllm.model_executor.layers.fla.ops.utils import SUPPRESS_LEVEL
 
 from vllm_ascend import envs
 
+import cloud_ops_turbo  # noqa: F401
+
 from .chunk_delta_h import chunk_gated_delta_rule_fwd_h  # noqa: F401
 from .chunk_delta_hupdate import chunk_gated_delta_rule_fwd_hupdate
 from .chunk_o import chunk_fwd_o  # noqa: F401
@@ -105,7 +107,6 @@ def chunk_gated_delta_rule_fwd(
     )
     # obtain WY representation. u is actually the new v.
     if use_cloud_ops:
-        import cloud_ops_turbo  # Lazy import to avoid loading SO at module import time
         beta_bht = beta.transpose(1, 2).contiguous()
         g_bht = g.transpose(1, 2).contiguous()
 
@@ -159,7 +160,7 @@ def chunk_gated_delta_rule_fwd(
         k_ascendc = k.to(torch.bfloat16).transpose(1, 2).contiguous()
         w_ascendc = w.to(torch.bfloat16)  # already [B, H, T, K]
         u_ascendc = u.to(torch.bfloat16)  # already [B, H, T, V]
-        g_ascendc = g.transpose(1, 2).contiguous()
+        g_ascendc = g_bht  # already [B, H, T], reused from cloud_ops_turbo call
         q_ascendc = q.to(torch.bfloat16).transpose(1, 2).contiguous()
     else:
         # Triton path: w/u are time-first [B, T, H, K/V].

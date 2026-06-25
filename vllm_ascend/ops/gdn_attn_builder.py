@@ -104,6 +104,7 @@ class _GDNChunkedPrefillBufferSlot:
     final_chunk_indices_chunk64: torch.Tensor
     chunk_indices_large_block: torch.Tensor
     block_indices_cumsum: torch.Tensor
+    chunk_offsets_idx: torch.Tensor
 
 
 @dataclass

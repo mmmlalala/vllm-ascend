@@ -110,6 +110,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Whether to disable cloud_ops_turbo custom AscendC operators and fall back
+    # to Triton implementations. Set to 1 to use legacy Triton path for debugging.
+    #   0: use cloud_ops_turbo (default)
+    #   1: disable all cloud_ops_turbo operators (cloud_chunk_scaled_dot_kkt,
+    #      cloud_solve_tril, cloud_recompute_wu, cloud_rmsnorm_silu)
+    "VLLM_ASCEND_DISABLE_CLOUD_OPS_TURBO": lambda: bool(int(os.getenv("VLLM_ASCEND_DISABLE_CLOUD_OPS_TURBO", "0"))),
 }
 
 # end-env-vars-definition

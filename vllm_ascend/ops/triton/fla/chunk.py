@@ -18,8 +18,6 @@ from vllm.model_executor.layers.fla.ops.utils import SUPPRESS_LEVEL
 
 from vllm_ascend import envs
 
-import cloud_ops_turbo  # noqa: F401
-
 from .chunk_delta_h import chunk_gated_delta_rule_fwd_h  # noqa: F401
 from .chunk_delta_hupdate import chunk_gated_delta_rule_fwd_hupdate
 from .chunk_o import chunk_fwd_o  # noqa: F401
@@ -107,6 +105,7 @@ def chunk_gated_delta_rule_fwd(
     )
     # obtain WY representation. u is actually the new v.
     if use_cloud_ops:
+        import cloud_ops_turbo  # noqa: F401
         beta_bht = beta.transpose(1, 2).contiguous()
         g_bht = g.transpose(1, 2).contiguous()
 

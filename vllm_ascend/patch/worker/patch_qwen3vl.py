@@ -10,6 +10,13 @@ from vllm.model_executor.models.qwen3_vl import (
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.ops.rotary_embedding import AscendMRotaryEmbedding
+# Ensure the custom op is registered before caching the reference.
+import vllm_ascend.ops.triton.linearnorm.split_qkv_rmsnorm_mrope  # noqa: F401
+
+# Cache the op reference at module level so that torch.compile (Dynamo) sees
+# it as a constant instead of going through _OpNamespace.__getattr__, which
+# causes graph breaks (ObservedAttributeError / gb0088).
+_split_qkv_rmsnorm_mrope = torch.ops.vllm.triton_split_qkv_rmsnorm_mrope
 
 
 def tensor_parallel_wrap(func):
@@ -40,7 +47,7 @@ def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_s
             cos_sin = cos_sin.to(qkv.device)
         if cos_sin.dtype != qkv.dtype:
             cos_sin = cos_sin.to(qkv.dtype)
-        q, k, v, _ = torch.ops.vllm.triton_split_qkv_rmsnorm_mrope(
+        q, k, v, _ = _split_qkv_rmsnorm_mrope(
             qkv=qkv,
             q_weight=self.q_norm.weight,
             k_weight=self.k_norm.weight,

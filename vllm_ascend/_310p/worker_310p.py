@@ -152,6 +152,12 @@ class NPUWorker310(NPUWorker):
         gc.collect()
         torch.npu.empty_cache()
 
+        # Ensure platform patches (e.g. torch.accelerator → torch.npu
+        # redirect) are applied in worker subprocess before MemorySnapshot
+        # calls torch.accelerator.memory_stats().
+        from vllm_ascend import _ensure_global_patch
+        _ensure_global_patch()
+
         # take current memory snapshot
         self.init_snapshot = MemorySnapshot()
         self.requested_memory = self.init_snapshot.total_memory * self.cache_config.gpu_memory_utilization

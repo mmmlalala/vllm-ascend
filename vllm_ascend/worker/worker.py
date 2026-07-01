@@ -413,6 +413,12 @@ class NPUWorker(WorkerBase):
         if get_ascend_device_type() == AscendDeviceType.A5:
             setup_ascend_local_comm_res(self.local_rank, self.vllm_config.kv_transfer_config)
 
+        # Ensure platform patches (e.g. torch.accelerator → torch.npu
+        # redirect) are applied in worker subprocess before MemorySnapshot
+        # calls torch.accelerator.memory_stats().
+        from vllm_ascend import _ensure_global_patch
+        _ensure_global_patch()
+
         # take current memory snapshot
         self.init_snapshot = MemorySnapshot()
         self.requested_memory = self.init_snapshot.total_memory * self.cache_config.gpu_memory_utilization

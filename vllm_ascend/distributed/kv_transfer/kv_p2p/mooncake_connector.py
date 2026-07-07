@@ -164,14 +164,27 @@ class KVCacheTaskTracker:
         # be force-freed.
         self.delayed_free_requests: OrderedDict[str, float] = OrderedDict()
         self.reqs_to_process: set[str] = set()
+        # Stores DONE signals that arrive before add_req_to_process() is called.
+        # This handles the race condition where the D-node's DONE_RECVING_MSG
+        # reaches the P-node before the worker has registered the request in
+        # reqs_to_process (ported from open-source vllm KVOutputAggregator pattern).
+        self.pending_done: set[str] = set()
 
     def add_req_to_process(self, request_id: str):
-        self.reqs_to_process.add(request_id)
+        with self.done_task_lock:
+            if request_id in self.pending_done:
+                # DONE signal already arrived, mark as finished immediately
+                self.finished_requests.add(request_id)
+                self.pending_done.discard(request_id)
+                self.delayed_free_requests.pop(request_id, None)
+            else:
+                self.reqs_to_process.add(request_id)
 
     def add_not_transfer_request(self, request_id: str):
         with self.done_task_lock:
             self.finished_requests.add(request_id)
             self.reqs_to_process.discard(request_id)
+            self.pending_done.discard(request_id)
 
     def update_done_task_count(self, request_id: str):
         with self.done_task_lock:
@@ -179,12 +192,17 @@ class KVCacheTaskTracker:
                 self.finished_requests.add(request_id)
                 self.reqs_to_process.discard(request_id)
                 self.delayed_free_requests.pop(request_id, None)
-            else:
+            elif request_id not in self.finished_requests:
+                # Store early DONE signal instead of just logging a warning.
+                # When add_req_to_process() is called later, it will check
+                # pending_done and mark the request as finished immediately.
+                self.pending_done.add(request_id)
                 logger.warning(
                     "MooncakeConnector finish req not in reqs to process. "
                     "request_id=%s. "
-                    "Possible cause: Request was already completed or not properly tracked. "
-                    "Check: Verify request lifecycle and tracking logic.",
+                    "Stored in pending_done for later processing. "
+                    "This typically indicates a race between DONE_RECVING_MSG "
+                    "and start_load_kv().",
                     request_id,
                 )
 
@@ -204,7 +222,12 @@ class KVCacheTaskTracker:
     def add_delayed_request(self, request_id: str, delay_start_time: float):
         """Add a delayed free request."""
         with self.done_task_lock:
-            if request_id in self.reqs_to_process:
+            if request_id in self.pending_done:
+                # DONE signal already arrived, mark as finished immediately
+                self.delayed_free_requests[request_id] = delay_start_time
+                self.finished_requests.add(request_id)
+                self.pending_done.discard(request_id)
+            elif request_id in self.reqs_to_process:
                 self.delayed_free_requests[request_id] = delay_start_time
 
     def _retrieve_expired_requests(self):

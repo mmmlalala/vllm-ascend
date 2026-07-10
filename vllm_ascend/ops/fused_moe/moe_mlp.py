@@ -15,9 +15,12 @@
 # This file is a part of the vllm-ascend project.
 
 
+import os
+
 import torch
 import torch_npu
 from torch.nn.functional import pad
+from vllm.logger import logger
 from vllm.triton_utils import HAS_TRITON
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
@@ -417,6 +420,34 @@ def unified_apply_mlp(*, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
     hidden_states = mlp_compute_input.hidden_states
     group_list = mlp_compute_input.group_list
     group_list_type = mlp_compute_input.group_list_type
+
+    if bool(int(os.getenv("VLLM_ASCEND_DEBUG_MOE_GROUP_LIST", "0"))) and group_list is not None:
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        # Raw group_list as passed to the GMM operator (for op-level debugging).
+        logger.info(
+            "[MoE-GMM-RAW] rank=%s group_list_type=%s group_list=%s",
+            rank,
+            group_list_type,
+            group_list.cpu().tolist(),
+        )
+        # Convert to per-expert token count for readability.
+        # group_list_type: 0=cumsum (prefix sum), 1=count (per-expert)
+        if group_list_type == 0:
+            expert_counts = torch.cat([group_list[:1], group_list[1:] - group_list[:-1]])
+        else:
+            expert_counts = group_list
+        logger.info(
+            "[MoE-GMM] rank=%s group_list_type=%s num_local_experts=%s "
+            "total_tokens=%s per_expert=%s max=%s min=%s",
+            rank,
+            group_list_type,
+            expert_counts.numel(),
+            expert_counts.sum().item(),
+            expert_counts.cpu().tolist(),
+            expert_counts.max().item(),
+            expert_counts.min().item(),
+        )
+
     dynamic_scale = mlp_compute_input.dynamic_scale
     topk_scales = mlp_compute_input.topk_scales
     w1 = mlp_compute_input.weights.w1

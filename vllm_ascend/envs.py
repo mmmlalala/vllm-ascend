@@ -116,6 +116,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     #   1: disable all cloud_ops_turbo operators (cloud_chunk_scaled_dot_kkt,
     #      cloud_solve_tril, cloud_recompute_wu, cloud_rmsnorm_silu)
     "VLLM_ASCEND_DISABLE_CLOUD_OPS_TURBO": lambda: bool(int(os.getenv("VLLM_ASCEND_DISABLE_CLOUD_OPS_TURBO", "0"))),
+    # Whether to force random expert routing for EP load-balance diagnosis.
+    # When set to 1, topk_ids are replaced with uniform random assignment so every
+    # rank receives near-equal tokens. This DESTROYS output correctness — use only
+    # for performance boundary detection (compare All2All/MC2 comm time with/without).
+    # 0: disabled (default), 1: enabled in real inference (not just profile run).
+    "VLLM_ASCEND_FORCE_LOAD_BALANCE": lambda: bool(int(os.getenv("VLLM_ASCEND_FORCE_LOAD_BALANCE", "0"))),
 }
 
 # end-env-vars-definition
